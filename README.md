@@ -8,8 +8,6 @@ Run Xbox Series games on Linux with [VIctory](https://github.com/Marvisak/VIctor
 
 Your game folder is mounted **read-only** every time the game runs.
 
-> **You need your own copy of the game,** dumped from a console you own. This repository has no game files, and it has nothing to do with VIctory's authors or with any game's developer or publisher. VIctory and its forks are a work in progress. Expect low frame rates, missing graphics and crashes.
-
 - [Quick start](#quick-start)
 - [Requirements](#requirements)
 - [Choosing a VIctory build (profiles)](#choosing-a-victory-build-profiles)
