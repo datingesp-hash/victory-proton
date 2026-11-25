@@ -1,0 +1,783 @@
+#!/usr/bin/env bash
+# victory-proton: build VIctory (https://github.com/Marvisak/VIctory), or any
+# fork of it, for Windows from Linux, and run it with GE-Proton's wine and
+# vkd3d-proton, with the game folder mounted read-only.
+#
+# Usage: victory-proton [-p profile] [command] [options]   (victory-proton help)
+set -euo pipefail
+trap 'printf "\e[1;31m==> error:\e[0m \"%s\" failed (line %d, code %d)\n" "$BASH_COMMAND" "$LINENO" "$?" >&2' ERR
+
+# ---------------------------------------------------------------- locations
+CONFIG_DIR=${VP_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/victory-proton}
+# Optional shell file with VP_* settings (see the README, "Configuration").
+# shellcheck source=/dev/null
+[[ -f $CONFIG_DIR/config ]] && source "$CONFIG_DIR/config"
+DATA=${VP_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/victory-proton}
+PROFILES_FILE=$CONFIG_DIR/profiles   # profiles you added
+DEFAULT_FILE=$CONFIG_DIR/profile     # the default profile's name
+GAME_FILE=$CONFIG_DIR/game           # the game folder
+REPO_DIR=$(dirname "$(realpath "${BASH_SOURCE[0]}")")
+WS_PATCH=$REPO_DIR/wine/wineserver-view-tree.patch
+TARGET=x86_64-pc-windows-msvc
+SYNCED=refs/victory-proton/synced    # last upstream commit this script checked out
+GE_REPO=GloriousEggroll/proton-ge-custom
+GE_MIN=GE-Proton11-13                # older dxil-spirv breaks the first mesh pipeline
+export PATH=$HOME/.cargo/bin:$PATH   # rustup's cargo before a system one
+
+# ---------------------------------------------------------------- output
+c_info=$'\e[1;36m' c_warn=$'\e[1;33m' c_err=$'\e[1;31m' c_dim=$'\e[2m' c_off=$'\e[0m'
+if [[ ! -t 2 ]]; then c_info= c_warn= c_err= c_dim= c_off=; fi
+info() { printf '%s==>%s %s\n' "$c_info" "$c_off" "$*" >&2; }
+warn() { printf '%s==> warning:%s %s\n' "$c_warn" "$c_off" "$*" >&2; }
+die()  { printf '%s==> error:%s %s\n' "$c_err" "$c_off" "$*" >&2; exit 1; }
+
+# The package that provides a command, for the distribution in use.
+pkg_hint() {
+    local cmd=$1 arch deb fed suse
+    case $cmd in
+        bwrap)      arch=bubblewrap deb=bubblewrap fed=bubblewrap suse=bubblewrap ;;
+        autoreconf) arch=autoconf deb=autoconf fed=autoconf suse=autoconf ;;
+        make|gcc)   arch=base-devel deb=build-essential fed='gcc make' suse='gcc make' ;;
+        *)          arch=$cmd deb=$cmd fed=$cmd suse=$cmd ;;
+    esac
+    if command -v pacman >/dev/null; then echo "sudo pacman -S --needed $arch"
+    elif command -v apt-get >/dev/null; then echo "sudo apt install $deb"
+    elif command -v dnf >/dev/null; then echo "sudo dnf install $fed"
+    elif command -v zypper >/dev/null; then echo "sudo zypper install $suse"
+    else echo "install '$arch' with your package manager"; fi
+}
+need() { local c; for c in "$@"; do command -v "$c" >/dev/null || die "'$c' is missing: $(pkg_hint "$c")"; done; }
+
+# /home/x/y -> Z:\home\x\y (wine maps Z: to /)
+winpath() { local p; p=$(realpath -m "$1"); printf 'Z:%s' "${p//\//\\}"; }
+
+# ---------------------------------------------------------------- profiles
+# A profile is one VIctory repository and branch. Each has its own checkout,
+# build, shader cache, saves and logs under $DATA/profiles/<name>, so
+# switching never mixes them. Only the wine prefix (wine + vkd3d-proton,
+# which VIctory does not write to) is shared.
+#
+# Built-in ones; `victory-proton profile add` puts yours in $PROFILES_FILE,
+# one per line: NAME URL BRANCH [VAR=VALUE ...]
+declare -A P_URL=() P_BRANCH=() P_ENV=() P_ABOUT=()
+add_builtin() { P_URL[$1]=$2 P_BRANCH[$1]=$3 P_ENV[$1]=$4 P_ABOUT[$1]=$5; }
+add_builtin upstream https://github.com/Marvisak/VIctory main "" \
+    "VIctory itself"
+add_builtin fxceless https://github.com/fxceless/victory-fork main "VICTORY_NO_WATCHDOG=1" \
+    "fork focused on getting the world to render"
+add_builtin myokex https://github.com/myokex/victory-amd victory-amd "VICTORY_NO_WATCHDOG=1" \
+    "fork of fxceless with AMD fixes"
+add_builtin joshuu https://github.com/JoshuuDev/victory-amd victory-amd "VICTORY_NO_WATCHDOG=1" \
+    "fork of myokex; fixes DirectStorage reads into guarded memory"
+BUILTINS=(upstream fxceless myokex joshuu)
+DEFAULT_PROFILE=fxceless
+
+if [[ -f $PROFILES_FILE ]]; then
+    while read -r name url branch env; do
+        [[ -z $name || $name == \#* ]] && continue
+        P_URL[$name]=$url P_BRANCH[$name]=${branch:-main} P_ENV[$name]=${env:-} P_ABOUT[$name]="added by you"
+    done <"$PROFILES_FILE"
+fi
+
+# github.com/OWNER/REPO[/tree/BRANCH], OWNER/REPO, or any git URL ->
+# "URL BRANCH" (BRANCH empty when not given).
+parse_repo() {
+    local s=$1 branch=
+    s=${s%/}
+    if [[ $s =~ ^(https?://github\.com/[^/]+/[^/]+)/tree/(.+)$ ]]; then
+        s=${BASH_REMATCH[1]} branch=${BASH_REMATCH[2]}
+    elif [[ $s =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+        s=https://github.com/$s
+    fi
+    s=${s%.git}
+    printf '%s %s\n' "$s" "$branch"
+}
+
+# The branch a remote's HEAD points at.
+remote_head() {
+    GIT_TERMINAL_PROMPT=0 git ls-remote --symref "$1" HEAD 2>/dev/null | sed -n 's|^ref: refs/heads/\(.*\)\tHEAD$|\1|p' || true
+}
+
+profile_add() {
+    (($#)) || die "usage: victory-proton profile add URL [NAME] [BRANCH] [VAR=VALUE ...]"
+    need git
+    local url branch name
+    read -r url branch <<<"$(parse_repo "$1")"
+    shift
+    if (($#)) && [[ $1 != *=* ]]; then name=$1; shift; fi
+    if (($#)) && [[ $1 != *=* ]]; then branch=$1; shift; fi
+    if [[ -z ${name:-} ]]; then
+        # The owner's name; owner-repo if that is taken by another repo.
+        local owner repo
+        owner=$(basename "$(dirname "$url")" | tr '[:upper:]' '[:lower:]')
+        repo=$(basename "$url" | tr '[:upper:]' '[:lower:]')
+        name=$owner
+        if [[ -n ${P_URL[$name]+x} && ${P_URL[$name]} != "$url" ]]; then name=$owner-$repo; fi
+    fi
+    local n
+    for n in ${name:-} $(printf '%s\n' "${!P_URL[@]}" | sort); do
+        if [[ ${P_URL[$n]:-} == "$url" && ( -z $branch || ${P_BRANCH[$n]} == "$branch" ) ]] && (($# == 0)); then
+            info "'$n' is a profile already ($url ${P_BRANCH[$n]}). Use it with: victory-proton -p $n"
+            ADDED=$n; return
+        fi
+    done
+    [[ $name =~ ^[A-Za-z0-9_.-]+$ ]] || die "a profile name may only have letters, digits, '.', '_' and '-'"
+    if [[ -z $branch ]]; then
+        branch=$(remote_head "$url")
+        [[ -n $branch ]] || die "cannot reach $url (is it public, and spelled right?)"
+    elif ! GIT_TERMINAL_PROMPT=0 git ls-remote --exit-code --heads "$url" "$branch" >/dev/null 2>&1; then
+        die "$url has no branch '$branch'"
+    fi
+    mkdir -p "$CONFIG_DIR"
+    touch "$PROFILES_FILE"
+    local tmp; tmp=$(mktemp)
+    awk -v n="$name" '$1 != n' "$PROFILES_FILE" >"$tmp"
+    printf '%s %s %s%s\n' "$name" "$url" "$branch" "${*:+ $*}" >>"$tmp"
+    mv "$tmp" "$PROFILES_FILE"
+    P_URL[$name]=$url P_BRANCH[$name]=$branch P_ENV[$name]="$*"
+    info "profile '$name': $url ($branch). Use it with: victory-proton -p $name"
+    ADDED=$name
+}
+
+profile_remove() {
+    local name=${1:-}
+    [[ -n $name ]] || die "usage: victory-proton profile remove NAME"
+    if [[ ! -f $PROFILES_FILE ]] || ! awk -v n="$name" '$1 == n {f=1} END {exit !f}' "$PROFILES_FILE"; then
+        if printf '%s\n' "${BUILTINS[@]}" | grep -qx "$name"; then die "'$name' is built in and cannot be removed"; fi
+        die "no profile '$name' of yours"
+    fi
+    local tmp; tmp=$(mktemp)
+    awk -v n="$name" '$1 != n' "$PROFILES_FILE" >"$tmp"
+    mv "$tmp" "$PROFILES_FILE"
+    info "removed profile '$name'. Its checkout, cache and saves are still in $DATA/profiles/$name (delete that folder to free the space)"
+    [[ -f $DEFAULT_FILE && $(<"$DEFAULT_FILE") == "$name" ]] && rm -f "$DEFAULT_FILE"
+    return 0
+}
+
+profile_list() {
+    local n
+    for n in $(printf '%s\n' "${!P_URL[@]}" | sort); do
+        printf '%s %-12s %s %s%s(%s)%s\n' "$([[ $n == "$PROFILE" ]] && echo '*' || echo ' ')" \
+            "$n" "${P_URL[$n]}" "${P_BRANCH[$n]}" " $c_dim" "${P_ABOUT[$n]}" "$c_off"
+    done
+    echo "${c_dim}* = the one used now. victory-proton profile NAME sets the default; -p NAME uses one for a run.$c_off"
+}
+
+profile_cmd() {
+    case ${1:-} in
+        "")        profile_list ;;
+        add)       shift; profile_add "$@" ;;
+        remove|rm) shift; profile_remove "$@" ;;
+        *)
+            [[ -n ${P_URL[$1]+x} ]] || die "no profile '$1' (have: $(printf '%s\n' "${!P_URL[@]}" | sort | xargs))"
+            mkdir -p "$CONFIG_DIR"
+            printf '%s\n' "$1" >"$DEFAULT_FILE"
+            info "default profile: $1 (${P_URL[$1]} ${P_BRANCH[$1]})" ;;
+    esac
+}
+
+# -p NAME|URL anywhere before `--` picks the profile for this run. A URL is
+# added as a profile first, so its build and saves are kept.
+PROFILE=${VP_PROFILE:-}
+argv=()
+while (($#)); do
+    case $1 in
+        --) argv+=("$@"); break ;;
+        -p|--profile) [[ $# -ge 2 ]] || die "a profile name or URL must follow $1"
+                      PROFILE=$2; shift 2; continue ;;
+        --profile=*)  PROFILE=${1#*=} ;;
+        *) argv+=("$1") ;;
+    esac
+    shift
+done
+set -- "${argv[@]+"${argv[@]}"}"
+if [[ $PROFILE == */* ]]; then ADDED=; profile_add "$PROFILE"; PROFILE=$ADDED; fi
+[[ -z $PROFILE && -f $DEFAULT_FILE ]] && PROFILE=$(<"$DEFAULT_FILE")
+PROFILE=${PROFILE:-$DEFAULT_PROFILE}
+[[ -n ${P_URL[$PROFILE]+x} ]] || die "no profile '$PROFILE' (have: $(printf '%s\n' "${!P_URL[@]}" | sort | xargs))"
+
+UPSTREAM=${VP_UPSTREAM:-${P_URL[$PROFILE]}}
+BRANCH=${VP_BRANCH:-${P_BRANCH[$PROFILE]}}
+PDATA=$DATA/profiles/$PROFILE        # src/, cache/, data/ (saves), logs/
+SRC=${VP_SRC:-$PDATA/src}
+EXE=$SRC/target/$TARGET/release/victory.exe
+
+# ---------------------------------------------------------------- GPU
+# nvidia, amd or intel: the vendor of the GPU the game most likely runs on (a
+# discrete NVIDIA card wins over an AMD or Intel integrated one). VP_GPU sets it.
+gpu_vendor() {
+    if [[ -n ${VP_GPU:-} && $VP_GPU != auto ]]; then echo "$VP_GPU"; return; fi
+    local v vendors=" "
+    for v in /sys/class/drm/card[0-9]*/device/vendor; do
+        [[ -r $v ]] && vendors+="$(<"$v") "
+    done
+    case $vendors in
+        *" 0x10de "*) echo nvidia ;;
+        *" 0x1002 "*) echo amd ;;
+        *" 0x8086 "*) echo intel ;;
+        *) echo unknown ;;
+    esac
+}
+# AMD (RADV): the meshlet-culling program 0xfc5e66f8f873d3bb page-faults the
+# GPU minutes into the world (fxceless/victory-fork#3); skip it.
+AMD_ENV="VICTORY_SKIP_PIPELINES=fc5e66f8f873d3bb"
+
+# The profile's variables, and the AMD ones on AMD.
+profile_vars() {
+    local all=${P_ENV[$PROFILE]:-}
+    [[ $(gpu_vendor) == amd ]] && all+=" $AMD_ENV"
+    printf '%s' "${all# }"
+}
+# Exports them, except those set already (yours win).
+export_profile_vars() {
+    local kv name
+    for kv in $(profile_vars); do
+        name=${kv%%=*}
+        if [[ -z ${!name+x} ]]; then export "${kv?}"; fi
+    done
+}
+
+# ---------------------------------------------------------------- game
+# The game folder is an Xbox Series (GDK) package dumped from a console you
+# own: MicrosoftGame.config names the executable.
+game_dir() {
+    if [[ -n ${VP_GAME_DIR:-} ]]; then printf '%s' "$VP_GAME_DIR"; return; fi
+    [[ -f $GAME_FILE ]] && cat "$GAME_FILE"
+    return 0
+}
+
+# The executable named in MicrosoftGame.config (the Series one if there are
+# several), else the only .exe in the folder.
+game_exe() {
+    local dir=$1 cfg exe
+    if [[ -n ${VP_GAME_EXE:-} ]]; then printf '%s' "$VP_GAME_EXE"; return; fi
+    cfg=$(find "$dir" -maxdepth 1 -iname microsoftgame.config -print -quit)
+    if [[ -n $cfg ]]; then
+        exe=$(grep -aoi '<Executable [^>]*>' "$cfg" | grep -ai 'Scarlett' | head -n1)
+        [[ -n $exe ]] || exe=$(grep -aoi '<Executable [^>]*>' "$cfg" | head -n1)
+        exe=$(sed -n 's/.*[Nn]ame="\([^"]*\)".*/\1/p' <<<"$exe")
+        [[ -n $exe && -f $dir/$exe ]] && { printf '%s' "$exe"; return; }
+    fi
+    local exes=()
+    mapfile -t exes < <(find "$dir" -maxdepth 1 -iname '*.exe' -printf '%f\n')
+    ((${#exes[@]} == 1)) && { printf '%s' "${exes[0]}"; return; }
+    return 1
+}
+
+check_game_dir() {
+    local dir=$1
+    [[ -d $dir ]] || die "not a folder: $dir"
+    game_exe "$dir" >/dev/null || die "$dir has no MicrosoftGame.config naming an .exe (is it the game's root folder?). Set VP_GAME_EXE if it is"
+}
+
+pick_dir() {
+    local d=
+    if [[ -n ${WAYLAND_DISPLAY:-${DISPLAY:-}} ]]; then
+        if command -v zenity >/dev/null; then
+            d=$(zenity --file-selection --directory --title="Choose the game folder (the one with MicrosoftGame.config)" 2>/dev/null) || true
+        elif command -v kdialog >/dev/null; then
+            d=$(kdialog --getexistingdirectory "$HOME" --title "Choose the game folder" 2>/dev/null) || true
+        fi
+    fi
+    if [[ -z $d && -t 0 ]]; then
+        read -r -e -p "Game folder (the one with MicrosoftGame.config): " d
+        d=${d/#\~/$HOME}
+    fi
+    [[ -n $d ]] || die "no folder chosen"
+    printf '%s' "$d"
+}
+
+game_set() {
+    local dir; dir=$(realpath -m "$1")
+    check_game_dir "$dir"
+    mkdir -p "$CONFIG_DIR"
+    printf '%s\n' "$dir" >"$GAME_FILE"
+    info "game: $dir ($(game_exe "$dir")). It is mounted read-only whenever the game runs."
+}
+
+# Asks for the game folder and saves it.
+pick_game() { local d; d=$(pick_dir) || exit 1; game_set "$d"; }
+
+game_cmd() {
+    case ${1:-} in
+        pick) pick_game ;;
+        "")
+            local dir; dir=$(game_dir)
+            if [[ -z $dir ]]; then pick_game; return; fi
+            echo "$dir  ($(game_exe "$dir" || echo 'no executable found'))" ;;
+        *) game_set "$1" ;;
+    esac
+}
+
+# The game folder for a run; asks once if none is set.
+require_game() {
+    GAME_DIR=$(game_dir)
+    if [[ -z $GAME_DIR ]]; then
+        info "no game folder set yet"
+        pick_game
+        GAME_DIR=$(game_dir)
+    fi
+    check_game_dir "$GAME_DIR"
+    GAME_EXE=$(game_exe "$GAME_DIR")
+}
+
+# ---------------------------------------------------------------- proton
+PROTON_DIR=${VP_PROTON:-}
+proton_dirs() {
+    printf '%s\n' "$HOME/.local/share/Steam/compatibilitytools.d" "$HOME/.steam/root/compatibilitytools.d" \
+        "$HOME/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d" \
+        /usr/share/steam/compatibilitytools.d "$DATA/proton"
+}
+# Where `proton` installs GE-Proton: Steam's folder if Steam is there.
+install_dir() {
+    if [[ -d $HOME/.local/share/Steam ]]; then echo "$HOME/.local/share/Steam/compatibilitytools.d"
+    else echo "$DATA/proton"; fi
+}
+proton_tag() { awk '{print $2}' "${1:-$PROTON_DIR}/version" 2>/dev/null; }
+
+# Every GE-Proton found, "TAG DIR", oldest first.
+list_ge() {
+    local base d tag
+    while read -r base; do
+        [[ -d $base ]] || continue
+        for d in "$base"/*/; do
+            d=${d%/}
+            [[ -x $d/proton && -f $d/version ]] || continue
+            tag=$(proton_tag "$d")
+            [[ $tag == GE-Proton* ]] && printf '%s %s\n' "$tag" "$d"
+        done
+    done < <(proton_dirs)
+}
+
+ver_ge() { [[ $(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1) == "$2" ]]; }   # $1 >= $2
+
+find_proton() {
+    if [[ -n $PROTON_DIR ]]; then
+        [[ -x $PROTON_DIR/proton ]] || die "VP_PROTON=$PROTON_DIR has no 'proton' in it"
+        return
+    fi
+    local best
+    best=$(list_ge | sort -V -k1,1 | tail -n1)
+    [[ -n $best ]] || die "no GE-Proton found; install the newest with: victory-proton proton"
+    PROTON_DIR=${best#* }
+    ver_ge "$(proton_tag)" "$GE_MIN" || warn "$(proton_tag) is older than $GE_MIN, which the first 3D scenes need (exit code 3): victory-proton proton"
+}
+
+latest_ge() {
+    curl -fsS --max-time 10 "https://api.github.com/repos/$GE_REPO/releases/latest" \
+        | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1 || true
+}
+
+check_proton() {
+    [[ -n ${VP_PROTON:-} ]] && return
+    local latest; latest=$(latest_ge)
+    [[ -n $latest ]] || return 0
+    [[ $'\n'$(list_ge) == *$'\n'"$latest "* ]] || warn "a newer GE-Proton is out ($latest; you use $(proton_tag)): victory-proton proton"
+}
+
+install_proton() {
+    need curl
+    local tag=${1:-$(latest_ge)}
+    [[ -n $tag ]] || die "cannot tell which GE-Proton is the newest (no network?)"
+    if [[ $'\n'$(list_ge) == *$'\n'"$tag "* ]]; then info "$tag is installed already"; return; fi
+    local tmp name=$tag-x86_64 base=https://github.com/$GE_REPO/releases/download/$tag dest
+    tmp=$(mktemp -d)
+    info "downloading $tag (~600 MB)"
+    if ! curl -fL --progress-bar -o "$tmp/$name.tar.gz" "$base/$name.tar.gz"; then
+        name=$tag   # older releases have no -x86_64 suffix
+        curl -fL --progress-bar -o "$tmp/$name.tar.gz" "$base/$name.tar.gz" || die "cannot download $tag"
+    fi
+    curl -fsSL -o "$tmp/$name.sha512sum" "$base/$name.sha512sum" || die "cannot download the checksum of $tag"
+    (cd "$tmp" && sha512sum -c --quiet "$name.sha512sum") || die "the checksum of $tag does not match"
+    dest=$(install_dir)
+    mkdir -p "$dest"
+    tar -xzf "$tmp/$name.tar.gz" -C "$dest"
+    rm -rf "$tmp"
+    info "$tag installed in $dest"
+}
+
+# ---------------------------------------------------------------- wineserver
+# wineserver keeps each process's mapped views in a list and walks it on
+# every map_view and unmap_view. A title that aliases GPU memory one 64 KiB
+# page at a time has 20,000+ views, so each call takes 0.5-1 ms, the server
+# sits at most of a core and VIctory's remap lock starves texture uploads for
+# seconds a frame. wine/wineserver-view-tree.patch indexes the views in a
+# red-black tree as well: about 10 us a call. The server must come from
+# exactly the tree of the Proton in use (same protocol), so it is built from
+# that GE-Proton release's own sources.
+wineserver_path() { printf '%s/wineserver/%s-viewtree' "$DATA" "$(proton_tag)"; }
+
+build_wineserver() {
+    find_proton
+    need git patch autoreconf bison flex make gcc perl
+    local tag; tag=$(proton_tag)
+    [[ $tag == GE-Proton* ]] || die "only GE-Proton is supported here (have: ${tag:-?})"
+    local root=$DATA/wineserver/build-$tag out; out=$(wineserver_path)
+    info "building wineserver with the view-tree patch for $tag (in $root, ~1 GB)"
+    mkdir -p "$root"
+    if [[ ! -d $root/ge/.git ]]; then
+        git init -q "$root/ge"
+        git -C "$root/ge" remote add origin "https://github.com/$GE_REPO"
+    fi
+    git -C "$root/ge" fetch -q --depth 1 origin tag "$tag"
+    git -C "$root/ge" checkout -q -f "$tag"
+    local m url sha
+    for m in wine wine-staging; do
+        url=$(git -C "$root/ge" config -f .gitmodules "submodule.$m.url")
+        sha=$(git -C "$root/ge" ls-tree HEAD "$m" | awk '{print $3}')
+        if [[ $(git -C "$root/ge/$m" rev-parse HEAD 2>/dev/null) != "$sha" ]]; then
+            info "fetching $m ($sha)"
+            rm -rf "${root:?}/ge/$m"
+            git init -q "$root/ge/$m"
+            git -C "$root/ge/$m" remote add origin "$url"
+            git -C "$root/ge/$m" fetch -q --depth 1 origin "$sha"
+            git -C "$root/ge/$m" checkout -q FETCH_HEAD
+        fi
+    done
+    # GE's own patching of wine: the helpers and the `pushd wine` section of
+    # its prep script (which starts with a git reset --hard/clean of wine/).
+    local prep=$root/ge/patches/protonprep-valve-staging.sh
+    [[ -f $prep ]] || die "$prep not found; GE may have changed its layout"
+    {
+        sed -n '/^apply_patch()/,/^}/p;/^apply_all_in_dir()/,/^}/p' "$prep"
+        awk '/^[[:space:]]*pushd wine$/ {on=1} on {print} on && /^[[:space:]]*popd/ {exit}' "$prep"
+    } >"$root/prep-wine.sh"
+    info "applying GE's patches to wine (log: $root/prep.log)"
+    (cd "$root/ge" && bash "$root/prep-wine.sh") >"$root/prep.log" 2>&1 || die "GE's patches failed; see $root/prep.log"
+    (cd "$root/ge/wine" && patch -p1 -s <"$WS_PATCH") || die "the view-tree patch does not apply to $tag; please open an issue"
+    info "configuring (wineserver only)"
+    (
+        cd "$root/ge/wine"
+        tools/make_specfiles >/dev/null 2>&1 || true
+        autoreconf -fi >/dev/null 2>&1
+        # Vulkan's generated sources are not needed for the server; empty
+        # stand-ins let configure write the Makefile without vk.xml.
+        local f
+        for f in include/wine/vulkan.h dlls/winevulkan/{loader_thunks.c,loader_thunks.h,vulkan_thunks.c,vulkan_thunks.h,winevulkan.json,winevulkan.spec}; do
+            [[ -e $f ]] || : >"$f"
+        done
+    )
+    mkdir -p "$root/build"
+    (cd "$root/build" && "$root/ge/wine/configure" --enable-archs=x86_64 --disable-tests \
+        --without-x --without-wayland --without-vulkan --without-freetype --without-gstreamer \
+        --without-pulse --without-alsa --without-oss --without-cups --without-sane --without-gphoto \
+        --without-krb5 --without-netapi --without-pcap --without-usb --without-v4l2 --without-opencl \
+        --without-sdl --without-capi --without-dbus --without-gnutls --without-opengl --without-osmesa \
+        --without-udev --without-unwind --without-ffmpeg >configure.log 2>&1) \
+        || die "configure failed; see $root/build/configure.log"
+    (cd "$root/build" && make -j"$(nproc)" server/wineserver >make.log 2>&1) \
+        || die "the build failed; see $root/build/make.log"
+    install -Dm755 "$root/build/server/wineserver" "$out"
+    info "done: $out (used automatically with $tag; VP_WINESERVER=0 turns it off)"
+}
+
+# ---------------------------------------------------------------- update
+update() {
+    need git
+    if [[ ! -d $SRC/.git ]]; then
+        info "cloning $UPSTREAM ($BRANCH) into $SRC"
+        mkdir -p "$(dirname "$SRC")"
+        # Borrow objects from other profiles' checkouts when the fork shares
+        # their history (much less to download); --dissociate keeps it apart.
+        local ref=() d
+        for d in "$DATA"/profiles/*/src; do
+            [[ $d != "$SRC" && -d $d/.git ]] && ref+=(--reference-if-able "$d")
+        done
+        git clone ${ref[@]+"${ref[@]}"} ${ref[@]+--dissociate} --branch "$BRANCH" "$UPSTREAM" "$SRC"
+        git -C "$SRC" update-ref "$SYNCED" HEAD
+        return
+    fi
+    info "profile $PROFILE: looking for updates ($UPSTREAM, $BRANCH)"
+    if ! git -C "$SRC" fetch --quiet "$UPSTREAM" "$BRANCH"; then
+        warn "cannot reach the repository; going on with the local copy ($(git -C "$SRC" log -1 --format='%h %cd' --date=short))"
+        return
+    fi
+    local here there synced
+    here=$(git -C "$SRC" rev-parse HEAD)
+    there=$(git -C "$SRC" rev-parse FETCH_HEAD)
+    synced=$(git -C "$SRC" rev-parse -q --verify "$SYNCED" || true)
+    if [[ $here == "$there" ]]; then
+        git -C "$SRC" update-ref "$SYNCED" HEAD
+        info "up to date ($(git -C "$SRC" log -1 --format='%h %s' | cut -c1-70))"
+        return
+    fi
+    if git -C "$SRC" merge-base --is-ancestor "$there" "$here" && [[ $here != "$synced" ]]; then
+        info "the local copy is ahead of the repository; leaving it as it is"
+        return
+    fi
+    info "new in the repository:"
+    # --max-count, not `| head`: under pipefail head's early exit kills git.
+    git -C "$SRC" --no-pager log --oneline --no-decorate --max-count=20 "$here..$there" | sed 's/^/     /' >&2
+    local total; total=$(git -C "$SRC" rev-list --count "$here..$there")
+    ((total > 20)) && printf '     ... and %d more\n' $((total - 20)) >&2
+    if ! git -C "$SRC" diff --quiet || ! git -C "$SRC" diff --cached --quiet; then
+        warn "$SRC has uncommitted changes; not updating (commit or stash them)"
+        return
+    fi
+    if git -C "$SRC" merge-base --is-ancestor "$here" "$there"; then
+        git -C "$SRC" merge --ff-only --quiet "$there"
+    elif [[ $here == "$synced" ]]; then
+        # Forks that keep their changes in one rebased commit rewrite history.
+        # HEAD is exactly what this script last checked out (no commits of
+        # yours on top), so following it loses nothing.
+        info "the repository rewrote its history; following it"
+        git -C "$SRC" reset --hard --quiet "$there"
+    else
+        warn "you have commits of your own in $SRC and the repository diverged; going on with the local copy"
+        return
+    fi
+    git -C "$SRC" update-ref "$SYNCED" HEAD
+    info "updated to $(git -C "$SRC" log -1 --format='%h %cd' --date=short)"
+}
+
+# ---------------------------------------------------------------- build
+build() {
+    command -v rustup >/dev/null || die "rustup is missing; run: victory-proton setup"
+    command -v cargo-xwin >/dev/null || die "cargo-xwin is missing; run: victory-proton setup"
+    [[ -d $SRC ]] || update
+    info "building VIctory for Windows (cargo xwin, $TARGET)"
+    # The repository's rust-toolchain.toml pins the toolchain; rustup fetches it.
+    (cd "$SRC" && cargo xwin build --release -p victory --target "$TARGET" "$@") \
+        || die "the build failed (see cargo's output above)"
+    [[ -f $EXE ]] || die "$EXE is not there after the build"
+}
+
+# ---------------------------------------------------------------- prefix
+steam_client() {
+    local d
+    for d in "$HOME/.steam/steam" "$HOME/.local/share/Steam" "$HOME/.var/app/com.valvesoftware.Steam/data/Steam"; do
+        [[ -d $d ]] && { echo "$d"; return; }
+    done
+    mkdir -p "$DATA/steam"; echo "$DATA/steam"
+}
+
+prefix() {
+    find_proton
+    local stamp=$DATA/prefix/.victory-proton
+    if [[ -d $DATA/prefix/pfx && -f $stamp && $(<"$stamp") == "$(proton_tag)" ]]; then return; fi
+    info "setting up the wine prefix with $(proton_tag) (installs DXVK and vkd3d-proton)"
+    mkdir -p "$DATA/prefix"
+    STEAM_COMPAT_DATA_PATH=$DATA/prefix STEAM_COMPAT_CLIENT_INSTALL_PATH=$(steam_client) WINEDEBUG=-all \
+        "$PROTON_DIR/proton" run "$EXE" config >/dev/null 2>&1 || true
+    [[ -f $DATA/prefix/pfx/drive_c/windows/system32/d3d12core.dll ]] \
+        || die "Proton did not set up the prefix in $DATA/prefix"
+    proton_tag >"$stamp"
+}
+
+# VIctory compiles a few helper shaders from HLSL at run time with
+# D3DCompile. Wine's builtin d3dcompiler_47 lacks parts of HLSL ("Method
+# 'InterlockedMax' is not defined on type 'RWByteAddressBuffer'"), so every
+# ExecuteIndirect is dropped and the GPU-driven world draws nothing; only 2D
+# shows. Microsoft's DLL (winetricks d3dcompiler_47) compiles them. Checked
+# on every launch because Proton may put its builtin back when it updates.
+d3dcompiler_native() {
+    local dll=$DATA/prefix/pfx/drive_c/windows/system32/d3dcompiler_47.dll
+    [[ -f $dll ]] && ! grep -aq 'Wine builtin DLL' "$dll"
+}
+d3dcompiler() {
+    d3dcompiler_native && return
+    need winetricks
+    info "installing Microsoft's d3dcompiler_47 in the prefix (wine's cannot compile VIctory's shaders)"
+    WINEPREFIX=$DATA/prefix/pfx WINE=$PROTON_DIR/files/bin/wine WINESERVER=$PROTON_DIR/files/bin/wineserver \
+        WINEDEBUG=-all winetricks -q --force d3dcompiler_47 >/dev/null 2>&1 || true
+    d3dcompiler_native || warn "could not install d3dcompiler_47; the 3D world will be black"
+    return 0
+}
+
+# ---------------------------------------------------------------- run
+running() { pgrep -f '^Z:.*release.victory\.exe' >/dev/null; }
+
+# bubblewrap needs unprivileged user namespaces; Ubuntu 23.10+ restricts them
+# with AppArmor unless bwrap has a profile.
+sandbox_ok() { [[ ${VP_SANDBOX:-1} != 0 ]] && bwrap --dev-bind / / -- true 2>/dev/null; }
+
+# Runs victory.exe with Proton's wine inside a mount namespace in which the
+# game folder is read-only: nothing VIctory or the title does can change it.
+launch() {
+    local label=$1; shift
+    running && die "victory.exe is running already; close it first (victory-proton kill)"
+    find_proton
+    require_game
+    mkdir -p "$PDATA/cache" "$PDATA/data" "$PDATA/logs"
+
+    export WINEPREFIX=$DATA/prefix/pfx
+    export WINEDLLOVERRIDES=${WINEDLLOVERRIDES:-"d3d12,d3d12core,dxgi,d3d11,d3d10core,d3d9,d3dcompiler_47=n,b"}
+    export WINEDEBUG=${WINEDEBUG:--all}
+    export WINEFSYNC=${WINEFSYNC:-1}
+    # Without the descriptor-heap path vkd3d-proton caps shader-visible view
+    # heaps at 1,000,000 descriptors; titles that ask for more fault the GPU.
+    export VKD3D_CONFIG=${VKD3D_CONFIG-descriptor_heap}
+    export RUST_LOG=${RUST_LOG:-info}
+    local penv; penv=$(profile_vars)
+    export_profile_vars
+
+    local sandbox=()
+    if sandbox_ok; then
+        sandbox=(bwrap --dev-bind / / --ro-bind "$GAME_DIR" "$GAME_DIR" --)
+    elif [[ ${VP_SANDBOX:-1} != 0 ]]; then
+        die "bubblewrap cannot create a sandbox here (see the README, \"Troubleshooting\"). VP_SANDBOX=0 runs without it, with the game folder writable"
+    else
+        warn "running without the sandbox: the game folder is not protected"
+    fi
+    # The patched wineserver (see "wineserver" above). Wine always execs the
+    # one next to it, but uses one already running for the prefix: so stop
+    # any, and start ours first, inside the sandbox (the server opens files
+    # for the title, so it must see the game folder read-only too).
+    local server=()
+    if [[ -z ${VP_WINESERVER+x} && -x $(wineserver_path) ]]; then
+        VP_WINESERVER=$(wineserver_path)
+    elif [[ ${VP_WINESERVER:-} == 0 ]]; then
+        VP_WINESERVER=
+    fi
+    if [[ -n ${VP_WINESERVER:-} ]]; then
+        [[ -x $VP_WINESERVER ]] || die "VP_WINESERVER=$VP_WINESERVER is not executable"
+        "$PROTON_DIR/files/bin/wineserver" -k 2>/dev/null || true
+        server=(sh -c '"$0" -p5 || exit 1; exec "$@"' "$VP_WINESERVER")
+    fi
+    export VICTORY_GAME_DIR VICTORY_CACHE_DIR VICTORY_DATA_DIR
+    VICTORY_GAME_DIR=$(winpath "$GAME_DIR")
+    VICTORY_CACHE_DIR=$(winpath "$PDATA/cache")
+    VICTORY_DATA_DIR=$(winpath "$PDATA/data")
+    local wrap=()   # VP_WRAP: a command to run wine under, for diagnostics
+    [[ -n ${VP_WRAP:-} ]] && read -r -a wrap <<<"$VP_WRAP"
+
+    local log; log=$PDATA/logs/$(date +%Y%m%d-%H%M%S)-$label.log
+    ln -sfn "$(basename "$log")" "$PDATA/logs/latest.log"
+    ln -sfn "profiles/$PROFILE/logs/$(basename "$log")" "$DATA/latest.log"
+    info "profile $PROFILE ($(git -C "$SRC" log -1 --format=%h 2>/dev/null || echo '?')), $(proton_tag), wineserver: ${VP_WINESERVER:-stock}"
+    [[ -n $penv ]] && info "with $penv"
+    info "log: $log"
+    cd "$PDATA"
+    set +e
+    ${sandbox[@]+"${sandbox[@]}"} ${server[@]+"${server[@]}"} ${wrap[@]+"${wrap[@]}"} \
+        "$PROTON_DIR/files/bin/wine" "$EXE" "$@" 2>&1 | tee "$log"
+    local rc=${PIPESTATUS[0]}
+    set -e
+    info "victory.exe exited with code $rc$( ((rc > 128)) && printf ' (signal %d)' $((rc - 128)))" 2>&1 | tee -a "$log" >&2
+    grep -aq 'GPUVM fault' "$log" && warn "the GPU faulted (GPUVM fault); see the README, \"Troubleshooting\""
+    grep -aq 'unhandled exception' "$log" && warn "the game stopped on an exception; crash reports in $PDATA/data/*/crashes.log"
+    return "$rc"
+}
+
+run_game() {
+    local do_update=1 args=()
+    while (($#)); do
+        case $1 in
+            --no-update|-n) do_update=0 ;;
+            --) shift; args=(-- "$@"); break ;;
+            *) args+=("$1") ;;
+        esac
+        shift
+    done
+    running && die "victory.exe is running already; close it first (victory-proton kill)"
+    require_game
+    ((do_update)) && update
+    build
+    prefix
+    d3dcompiler
+    ((do_update)) && check_proton
+    if [[ -z ${VP_WINESERVER+x} && ! -x $(wineserver_path) ]]; then
+        warn "no patched wineserver for $(proton_tag): busy scenes will be many times slower (build it with: victory-proton wineserver)"
+    fi
+    info "starting $GAME_EXE (the window is called VIctory)"
+    launch run "$(winpath "$GAME_DIR/$GAME_EXE")" --execute "${args[@]}"
+}
+
+# ---------------------------------------------------------------- status
+status() {
+    local ok="${c_info}ok$c_off" no="${c_warn}no$c_off" dir
+    printf 'profile     %s  %s %s\n' "$PROFILE" "$UPSTREAM" "$BRANCH"
+    printf 'checkout    %s %s\n' "$SRC" "$(git -C "$SRC" log -1 --format='(%h %cd)' --date=short 2>/dev/null || echo '(not cloned yet)')"
+    dir=$(game_dir)
+    if [[ -n $dir ]]; then printf 'game        %s  (%s)\n' "$dir" "$(game_exe "$dir" 2>/dev/null || echo 'no executable found')"
+    else printf 'game        %s (victory-proton game)\n' "$no"; fi
+    PROTON_DIR=$( (find_proton 2>/dev/null; printf '%s' "$PROTON_DIR") || true)
+    if [[ -n $PROTON_DIR ]]; then
+        printf 'proton      %s  %s\n' "$(proton_tag)" "$PROTON_DIR"
+        printf 'wineserver  %s\n' "$([[ -x $(wineserver_path) ]] && echo "$ok patched" || echo "$no stock (victory-proton wineserver)")"
+    else printf 'proton      %s (victory-proton proton)\n' "$no"; fi
+    printf 'd3dcompiler %s\n' "$(d3dcompiler_native && echo "$ok Microsoft's" || echo "$no wine's (installed on the next run)")"
+    printf 'gpu         %s\n' "$(gpu_vendor)"
+    printf 'variables   %s\n' "$(profile_vars)"
+    printf 'sandbox     %s\n' "$(sandbox_ok && echo "$ok (game folder read-only)" || echo "$no")"
+    printf 'data        %s\n' "$DATA"
+    printf 'config      %s\n' "$CONFIG_DIR"
+}
+
+# ---------------------------------------------------------------- setup
+setup() {
+    need git curl bwrap winetricks
+    if ! command -v rustup >/dev/null; then
+        info "installing rustup into ~/.cargo (your PATH and shell profile are left alone)"
+        curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none --profile minimal
+    fi
+    if ! command -v cargo-xwin >/dev/null; then
+        info "installing cargo-xwin (fetches the Windows CRT and SDK when building)"
+        rustup toolchain install stable --profile minimal
+        cargo +stable install --locked cargo-xwin
+    fi
+    [[ -n $(list_ge) || -n $PROTON_DIR ]] || install_proton
+    find_proton
+    info "Proton: $(proton_tag) ($PROTON_DIR)"
+    sandbox_ok || warn "bubblewrap cannot create a sandbox here; see the README, \"Troubleshooting\""
+    [[ -n $(game_dir) ]] || pick_game
+    update
+    build
+    prefix
+    d3dcompiler
+    if ! command -v victory-proton >/dev/null && [[ ! -e $HOME/.local/bin/victory-proton ]]; then
+        mkdir -p "$HOME/.local/bin"
+        ln -s "$REPO_DIR/victory-proton" "$HOME/.local/bin/victory-proton"
+        info "linked ~/.local/bin/victory-proton to this script"
+    fi
+    [[ -x $(wineserver_path) ]] || info "recommended next: victory-proton wineserver (10-20 min once per GE-Proton release)"
+    info "ready. Run: victory-proton"
+}
+
+usage() {
+    cat <<EOF
+victory-proton: run Xbox Series titles with VIctory on Linux, through GE-Proton
+
+  victory-proton [-p PROFILE] [run] [--no-update] [-- game args]
+                          update the profile's VIctory, build it if needed, run the game
+  victory-proton setup    install the tools, pick the game, clone, build, set up wine
+  victory-proton game [PATH|pick]
+                          show or set the game folder (the one with MicrosoftGame.config)
+  victory-proton profile  list the VIctory repositories you can run
+  victory-proton profile NAME                       make NAME the default
+  victory-proton profile add URL [NAME] [BRANCH] [VAR=VALUE ...]
+                                                    add a fork (github.com/o/r/tree/branch works)
+  victory-proton profile remove NAME
+  victory-proton -p NAME|URL ...                    use another profile for one command
+  victory-proton wineserver  build the faster wineserver for your GE-Proton (recommended)
+  victory-proton proton [TAG]  install the newest GE-Proton (or TAG)
+  victory-proton update | build   only update, or only build
+  victory-proton status   what is set up and what is missing
+  victory-proton log      the last run's log
+  victory-proton kill     close the game
+  victory-proton victory ARGS  run victory.exe with any of its own commands
+
+Profile now: $PROFILE ($UPSTREAM $BRANCH)
+Settings: VP_* variables, in the environment or in $CONFIG_DIR/config (see the README).
+EOF
+}
+
+cmd=${1:-run}
+[[ $# -gt 0 ]] && shift
+case $cmd in
+    run)        run_game "$@" ;;
+    setup)      setup ;;
+    game)       game_cmd "$@" ;;
+    profile|profiles) profile_cmd "$@" ;;
+    wineserver) build_wineserver ;;
+    proton)     install_proton "$@" ;;
+    update)     update ;;
+    build)      build "$@" ;;
+    status)     status ;;
+    log|logs)   [[ -e $DATA/latest.log ]] || die "no runs yet"; echo "$(readlink -f "$DATA/latest.log")"; tail -n "${1:-40}" "$DATA/latest.log" ;;
+    kill)       if pkill -f '^Z:.*release.victory\.exe'; then info "game closed"; else info "it was not running"; fi ;;
+    victory)    [[ -f $EXE ]] || build; prefix; launch tool "$@" ;;
+    help|-h|--help) usage ;;
+    -*)         run_game "$cmd" "$@" ;;
+    *)          usage >&2; exit 1 ;;
+esac
