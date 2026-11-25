@@ -69,6 +69,7 @@ Built-in profiles:
 | `upstream` | [Marvisak/VIctory](https://github.com/Marvisak/VIctory) `main` | VIctory itself |
 | `myokex` | [myokex/victory-amd](https://github.com/myokex/victory-amd) `victory-amd` | fork of `fxceless` with AMD fixes |
 | `joshuu` | [JoshuuDev/victory-amd](https://github.com/JoshuuDev/victory-amd) `victory-amd` | fork of `myokex`; fixes a crash as the first cutscene ends |
+| `copperearth` | [Copperearth/VIctory-wineless](https://github.com/Copperearth/VIctory-wineless) `main` | native Linux runtime: no wine (see [Native profiles](#native-profiles)) |
 
 ```sh
 victory-proton profile                 # list them; * marks the one in use
@@ -88,6 +89,25 @@ victory-proton profile remove mytest
 
 Any `VAR=VALUE` after the address is set every time that profile runs. Use it for the switches a fork's README recommends. Profiles you add are kept in `~/.config/victory-proton/profiles`, one per line (`NAME URL BRANCH [VAR=VALUE ...]`), and you can edit that file by hand.
 
+### Native profiles
+
+Some forks run VIctory as a Linux program, with no wine and no Windows DLL (`copperearth`). The profile's `VP_NATIVE=1` tells the launcher. For these profiles:
+
+- VIctory is built for Linux with plain `cargo build`, without cargo-xwin.
+- There is no wine prefix, no `d3dcompiler_47` and no wineserver. GE-Proton is not used.
+- vkd3d-proton is needed as native Linux libraries. Proton ships only its Windows DLLs, so `victory-proton vkd3d` builds it from source into `~/.local/share/victory-proton/vkd3d-proton`. This happens by itself on the first run; run the command again to update it. Set `VICTORY_VKD3D` to use one you built yourself.
+- The game still runs in the same read-only sandbox, with the same per-profile folders.
+
+Native builds also need `ninja`, `glslang` and `widl` (for vkd3d-proton; `meson` is installed into a Python venv if missing), and `SDL3` and `libpulse` at run time:
+
+| Distribution | Command |
+|---|---|
+| Arch, CachyOS, Manjaro | `sudo pacman -S --needed ninja glslang wine sdl3 libpulse` |
+| Debian, Ubuntu | `sudo apt install ninja-build glslang-tools wine64-tools python3-venv libsdl3-0 libpulse0` |
+| Fedora | `sudo dnf install ninja-build glslang wine-devel SDL3 pulseaudio-libs` |
+
+To mark a fork you add as native: `victory-proton profile add someone/fork NAME BRANCH VP_NATIVE=1`.
+
 **Updating.** Every run fetches the profile's branch and fast-forwards to it. Some forks keep their changes in one commit that they rebase, which rewrites history; when that happens, the checkout follows it, as long as you haven't committed anything of your own there. If you have local commits or uncommitted changes, the checkout is left alone and you get a warning.
 
 ## Commands
@@ -104,6 +124,7 @@ Any `VAR=VALUE` after the address is set every time that profile runs. Use it fo
 | `victory-proton profile ...` | list, choose, add or remove profiles (see above) |
 | `victory-proton -p NAME\|URL COMMAND` | run any command with another profile |
 | `victory-proton wineserver` | build the faster wineserver for your GE-Proton (see [How it works](#how-it-works)) |
+| `victory-proton vkd3d` | build or update native vkd3d-proton (native profiles only) |
 | `victory-proton proton [TAG]` | install the newest GE-Proton, or the release `TAG` |
 | `victory-proton update` / `build` | only update, or only build |
 | `victory-proton status` | what is set up and what is missing |

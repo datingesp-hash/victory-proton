@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # victory-proton: build VIctory (https://github.com/Marvisak/VIctory), or any
 # fork of it, for Windows from Linux, and run it with GE-Proton's wine and
-# vkd3d-proton, with the game folder mounted read-only.
+# vkd3d-proton, with the game folder mounted read-only. Forks with a native
+# Linux runtime (VP_NATIVE=1) are built for Linux and run without wine.
 #
 # Usage: victory-proton [-p profile] [command] [options]   (victory-proton help)
 set -euo pipefail
@@ -38,6 +39,10 @@ pkg_hint() {
         bwrap)      arch=bubblewrap deb=bubblewrap fed=bubblewrap suse=bubblewrap ;;
         autoreconf) arch=autoconf deb=autoconf fed=autoconf suse=autoconf ;;
         make|gcc)   arch=base-devel deb=build-essential fed='gcc make' suse='gcc make' ;;
+        glslangValidator) arch=glslang deb=glslang-tools fed=glslang suse=glslang-devel ;;
+        widl)       arch=wine deb=wine64-tools fed=wine-devel suse=wine-devel ;;
+        ninja)      arch=ninja deb=ninja-build fed=ninja-build suse=ninja ;;
+        python3)    arch=python deb=python3-venv fed=python3 suse=python3 ;;
         *)          arch=$cmd deb=$cmd fed=$cmd suse=$cmd ;;
     esac
     if command -v pacman >/dev/null; then echo "sudo pacman -S --needed $arch"
@@ -69,7 +74,9 @@ add_builtin myokex https://github.com/myokex/victory-amd victory-amd "VICTORY_NO
     "fork of fxceless with AMD fixes"
 add_builtin joshuu https://github.com/JoshuuDev/victory-amd victory-amd "VICTORY_NO_WATCHDOG=1" \
     "fork of myokex; fixes DirectStorage reads into guarded memory"
-BUILTINS=(upstream fxceless myokex joshuu)
+add_builtin copperearth https://github.com/Copperearth/VIctory-wineless main "VP_NATIVE=1 VICTORY_NO_WATCHDOG=1" \
+    "native Linux runtime, no wine"
+BUILTINS=(upstream fxceless myokex joshuu copperearth)
 DEFAULT_PROFILE=fxceless
 
 if [[ -f $PROFILES_FILE ]]; then
@@ -200,7 +207,21 @@ UPSTREAM=${VP_UPSTREAM:-${P_URL[$PROFILE]}}
 BRANCH=${VP_BRANCH:-${P_BRANCH[$PROFILE]}}
 PDATA=$DATA/profiles/$PROFILE        # src/, cache/, data/ (saves), logs/
 SRC=${VP_SRC:-$PDATA/src}
-EXE=$SRC/target/$TARGET/release/victory.exe
+# VP_NATIVE=1 (in the environment or among a profile's variables): the fork
+# has a native Linux runtime (no wine, no Windows DLL). It is built for Linux
+# with plain cargo and loads vkd3d-proton built as native .so libraries
+# (VICTORY_VKD3D), SDL3 for the window and pads, and libpulse for sound.
+NATIVE=${VP_NATIVE:-}
+if [[ -z $NATIVE ]]; then
+    NATIVE=0
+    [[ " ${P_ENV[$PROFILE]:-} " == *" VP_NATIVE=1 "* ]] && NATIVE=1
+fi
+if ((NATIVE)); then EXE=$SRC/target/release/victory
+else EXE=$SRC/target/$TARGET/release/victory.exe; fi
+VKD3D_SRC=$DATA/vkd3d-proton/src     # native vkd3d-proton: source,
+VKD3D_DIR=$DATA/vkd3d-proton/install # and where it is installed
+# A running game's command line, the wine build or the native one.
+PROC_RE='release/victory(\.exe)? run'
 
 # ---------------------------------------------------------------- GPU
 # nvidia, amd or intel: the vendor of the GPU the game most likely runs on (a
@@ -534,6 +555,14 @@ update() {
 # ---------------------------------------------------------------- build
 build() {
     command -v rustup >/dev/null || die "rustup is missing; run: victory-proton setup"
+    if ((NATIVE)); then
+        [[ -d $SRC ]] || update
+        info "building VIctory for Linux (native runtime, cargo build)"
+        (cd "$SRC" && cargo build --release -p victory "$@") \
+            || die "the build failed (see cargo's output above)"
+        [[ -f $EXE ]] || die "$EXE is not there after the build"
+        return
+    fi
     command -v cargo-xwin >/dev/null || die "cargo-xwin is missing; run: victory-proton setup"
     [[ -d $SRC ]] || update
     info "building VIctory for Windows (cargo xwin, $TARGET)"
@@ -542,6 +571,48 @@ build() {
         || die "the build failed (see cargo's output above)"
     [[ -f $EXE ]] || die "$EXE is not there after the build"
 }
+
+# ---------------------------------------------------------------- vkd3d-proton
+# The native runtime needs vkd3d-proton as Linux libraries
+# (libvkd3d-proton-d3d12{,core}.so). Proton ships only its Windows DLLs, so
+# it is built once from source. VICTORY_VKD3D set by you wins.
+vkd3d_lib() {
+    local f
+    f=$(find "$VKD3D_DIR" -name 'libvkd3d-proton-d3d12.so' -print -quit 2>/dev/null || true)
+    [[ -n $f ]] && dirname "$f"
+    return 0
+}
+build_vkd3d() {
+    need git ninja glslangValidator widl
+    local meson; meson=$(command -v meson || true)
+    if [[ -z $meson ]]; then
+        need python3
+        meson=$DATA/vkd3d-proton/meson/bin/meson
+        if [[ ! -x $meson ]]; then
+            info "installing meson into $DATA/vkd3d-proton/meson (the system is left alone)"
+            python3 -m venv "$DATA/vkd3d-proton/meson" && "$DATA/vkd3d-proton/meson/bin/pip" install -q meson \
+                || die "cannot install meson"
+        fi
+    fi
+    if [[ -d $VKD3D_SRC/.git ]]; then
+        info "updating vkd3d-proton in $VKD3D_SRC"
+        { git -C "$VKD3D_SRC" pull -q --ff-only && git -C "$VKD3D_SRC" submodule update -q --init --recursive; } \
+            || warn "cannot update vkd3d-proton; building what is there"
+    else
+        info "cloning vkd3d-proton into $VKD3D_SRC"
+        mkdir -p "$(dirname "$VKD3D_SRC")"
+        git clone -q --recurse-submodules https://github.com/HansKristian-Work/vkd3d-proton "$VKD3D_SRC"
+    fi
+    info "building native vkd3d-proton ($(git -C "$VKD3D_SRC" log -1 --format='%h %cd' --date=short))"
+    local b=$VKD3D_SRC/build-native
+    [[ -d $b ]] || "$meson" setup "$b" "$VKD3D_SRC" --buildtype=release --prefix="$VKD3D_DIR" >/dev/null \
+        || die "meson setup of vkd3d-proton failed"
+    # A generated header sometimes races; a second run finishes it.
+    ninja -C "$b" install >/dev/null 2>&1 || ninja -C "$b" install || die "the vkd3d-proton build failed"
+    [[ -n $(vkd3d_lib) ]] || die "no libvkd3d-proton-d3d12.so in $VKD3D_DIR after the build"
+    info "done: $(vkd3d_lib) (used by native profiles)"
+}
+vkd3d_ready() { [[ -n ${VICTORY_VKD3D:-} || -n $(vkd3d_lib) ]] || build_vkd3d; }
 
 # ---------------------------------------------------------------- prefix
 steam_client() {
@@ -553,6 +624,7 @@ steam_client() {
 }
 
 prefix() {
+    ((NATIVE)) && return
     find_proton
     local stamp=$DATA/prefix/.victory-proton
     if [[ -d $DATA/prefix/pfx && -f $stamp && $(<"$stamp") == "$(proton_tag)" ]]; then return; fi
@@ -576,6 +648,7 @@ d3dcompiler_native() {
     [[ -f $dll ]] && ! grep -aq 'Wine builtin DLL' "$dll"
 }
 d3dcompiler() {
+    ((NATIVE)) && return
     d3dcompiler_native && return
     need winetricks
     info "installing Microsoft's d3dcompiler_47 in the prefix (wine's cannot compile VIctory's shaders)"
@@ -586,7 +659,7 @@ d3dcompiler() {
 }
 
 # ---------------------------------------------------------------- run
-running() { pgrep -f '^Z:.*release.victory\.exe' >/dev/null; }
+running() { pgrep -f "$PROC_RE" >/dev/null; }
 
 # bubblewrap needs unprivileged user namespaces; Ubuntu 23.10+ restricts them
 # with AppArmor unless bwrap has a profile.
@@ -596,7 +669,8 @@ sandbox_ok() { [[ ${VP_SANDBOX:-1} != 0 ]] && bwrap --dev-bind / / -- true 2>/de
 # game folder is read-only: nothing VIctory or the title does can change it.
 launch() {
     local label=$1; shift
-    running && die "victory.exe is running already; close it first (victory-proton kill)"
+    running && die "VIctory is running already; close it first (victory-proton kill)"
+    ((NATIVE)) && { launch_native "$label" "$@"; return; }
     find_proton
     require_game
     mkdir -p "$PDATA/cache" "$PDATA/data" "$PDATA/logs"
@@ -660,6 +734,46 @@ launch() {
     return "$rc"
 }
 
+# The native build: the same sandbox and per-profile folders, Linux paths,
+# no wine.
+launch_native() {
+    local label=$1; shift
+    require_game
+    mkdir -p "$PDATA/cache" "$PDATA/data" "$PDATA/logs"
+    export VICTORY_VKD3D=${VICTORY_VKD3D:-$(vkd3d_lib)}
+    [[ -n $VICTORY_VKD3D ]] || die "native vkd3d-proton is missing (victory-proton vkd3d)"
+    export VKD3D_CONFIG=${VKD3D_CONFIG-descriptor_heap}
+    export VKD3D_SHADER_CACHE_PATH=${VKD3D_SHADER_CACHE_PATH:-$PDATA}
+    export RUST_LOG=${RUST_LOG:-info}
+    local penv; penv=$(profile_vars)
+    export_profile_vars
+    local sandbox=()
+    if sandbox_ok; then
+        sandbox=(bwrap --dev-bind / / --ro-bind "$GAME_DIR" "$GAME_DIR" --)
+    elif [[ ${VP_SANDBOX:-1} != 0 ]]; then
+        die "bubblewrap cannot create a sandbox here (see the README, \"Troubleshooting\"). VP_SANDBOX=0 runs without it, with the game folder writable"
+    else
+        warn "running without the sandbox: the game folder is not protected"
+    fi
+    export VICTORY_GAME_DIR=$GAME_DIR VICTORY_CACHE_DIR=$PDATA/cache VICTORY_DATA_DIR=$PDATA/data
+    local wrap=()
+    [[ -n ${VP_WRAP:-} ]] && read -r -a wrap <<<"$VP_WRAP"
+    local log; log=$PDATA/logs/$(date +%Y%m%d-%H%M%S)-$label.log
+    ln -sfn "$(basename "$log")" "$PDATA/logs/latest.log"
+    ln -sfn "profiles/$PROFILE/logs/$(basename "$log")" "$DATA/latest.log"
+    info "profile $PROFILE ($(git -C "$SRC" log -1 --format=%h 2>/dev/null || echo '?')), native, vkd3d-proton: $VICTORY_VKD3D"
+    [[ -n $penv ]] && info "with $penv"
+    info "log: $log"
+    cd "$PDATA"
+    set +e
+    ${sandbox[@]+"${sandbox[@]}"} ${wrap[@]+"${wrap[@]}"} "$EXE" "$@" 2>&1 | tee "$log"
+    local rc=${PIPESTATUS[0]}
+    set -e
+    info "victory exited with code $rc$( ((rc > 128)) && printf ' (signal %d)' $((rc - 128)))" 2>&1 | tee -a "$log" >&2
+    grep -aq 'GPUVM fault' "$log" && warn "the GPU faulted (GPUVM fault); see the README, \"Troubleshooting\""
+    return "$rc"
+}
+
 run_game() {
     local do_update=1 args=()
     while (($#)); do
@@ -670,10 +784,16 @@ run_game() {
         esac
         shift
     done
-    running && die "victory.exe is running already; close it first (victory-proton kill)"
+    running && die "VIctory is running already; close it first (victory-proton kill)"
     require_game
     ((do_update)) && update
     build
+    if ((NATIVE)); then
+        vkd3d_ready
+        info "starting $GAME_EXE natively, without wine"
+        launch run run "$GAME_DIR/$GAME_EXE" --execute "${args[@]}"
+        return
+    fi
     prefix
     d3dcompiler
     ((do_update)) && check_proton
@@ -692,12 +812,17 @@ status() {
     dir=$(game_dir)
     if [[ -n $dir ]]; then printf 'game        %s  (%s)\n' "$dir" "$(game_exe "$dir" 2>/dev/null || echo 'no executable found')"
     else printf 'game        %s (victory-proton game)\n' "$no"; fi
-    PROTON_DIR=$( (find_proton 2>/dev/null; printf '%s' "$PROTON_DIR") || true)
-    if [[ -n $PROTON_DIR ]]; then
-        printf 'proton      %s  %s\n' "$(proton_tag)" "$PROTON_DIR"
-        printf 'wineserver  %s\n' "$([[ -x $(wineserver_path) ]] && echo "$ok patched" || echo "$no stock (victory-proton wineserver)")"
-    else printf 'proton      %s (victory-proton proton)\n' "$no"; fi
-    printf 'd3dcompiler %s\n' "$(d3dcompiler_native && echo "$ok Microsoft's" || echo "$no wine's (installed on the next run)")"
+    if ((NATIVE)); then
+        printf 'runtime     native Linux (no wine)\n'
+        printf 'vkd3d       %s\n' "$( [[ -n ${VICTORY_VKD3D:-} ]] && echo "$ok $VICTORY_VKD3D" || { [[ -n $(vkd3d_lib) ]] && echo "$ok $(vkd3d_lib)"; } || echo "$no not built (victory-proton vkd3d)")"
+    else
+        PROTON_DIR=$( (find_proton 2>/dev/null; printf '%s' "$PROTON_DIR") || true)
+        if [[ -n $PROTON_DIR ]]; then
+            printf 'proton      %s  %s\n' "$(proton_tag)" "$PROTON_DIR"
+            printf 'wineserver  %s\n' "$([[ -x $(wineserver_path) ]] && echo "$ok patched" || echo "$no stock (victory-proton wineserver)")"
+        else printf 'proton      %s (victory-proton proton)\n' "$no"; fi
+        printf 'd3dcompiler %s\n' "$(d3dcompiler_native && echo "$ok Microsoft's" || echo "$no wine's (installed on the next run)")"
+    fi
     printf 'gpu         %s\n' "$(gpu_vendor)"
     printf 'variables   %s\n' "$(profile_vars)"
     printf 'sandbox     %s\n' "$(sandbox_ok && echo "$ok (game folder read-only)" || echo "$no")"
@@ -724,6 +849,7 @@ setup() {
     [[ -n $(game_dir) ]] || pick_game
     update
     build
+    ((NATIVE)) && vkd3d_ready
     prefix
     d3dcompiler
     if ! command -v victory-proton >/dev/null && [[ ! -e $HOME/.local/bin/victory-proton ]]; then
@@ -751,6 +877,7 @@ victory-proton: run Xbox Series titles with VIctory on Linux, through GE-Proton
   victory-proton profile remove NAME
   victory-proton -p NAME|URL ...                    use another profile for one command
   victory-proton wineserver  build the faster wineserver for your GE-Proton (recommended)
+  victory-proton vkd3d    build native vkd3d-proton, for native profiles (done on first run)
   victory-proton proton [TAG]  install the newest GE-Proton (or TAG)
   victory-proton update | build   only update, or only build
   victory-proton status   what is set up and what is missing
@@ -771,13 +898,14 @@ case $cmd in
     game)       game_cmd "$@" ;;
     profile|profiles) profile_cmd "$@" ;;
     wineserver) build_wineserver ;;
+    vkd3d)      build_vkd3d ;;
     proton)     install_proton "$@" ;;
     update)     update ;;
     build)      build "$@" ;;
     status)     status ;;
     log|logs)   [[ -e $DATA/latest.log ]] || die "no runs yet"; echo "$(readlink -f "$DATA/latest.log")"; tail -n "${1:-40}" "$DATA/latest.log" ;;
-    kill)       if pkill -f '^Z:.*release.victory\.exe'; then info "game closed"; else info "it was not running"; fi ;;
-    victory)    [[ -f $EXE ]] || build; prefix; launch tool "$@" ;;
+    kill)       if pkill -f "$PROC_RE"; then info "game closed"; else info "it was not running"; fi ;;
+    victory)    [[ -f $EXE ]] || build; prefix; ((NATIVE)) && vkd3d_ready; launch tool "$@" ;;
     help|-h|--help) usage ;;
     -*)         run_game "$cmd" "$@" ;;
     *)          usage >&2; exit 1 ;;
