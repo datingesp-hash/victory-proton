@@ -251,7 +251,7 @@ game_dir() {
 game_exe() {
     local dir=$1 cfg exe
     if [[ -n ${VP_GAME_EXE:-} ]]; then printf '%s' "$VP_GAME_EXE"; return; fi
-    cfg=$(find "$dir" -maxdepth 1 -iname microsoftgame.config -print -quit)
+    cfg=$(find "$dir/" -maxdepth 1 -iname microsoftgame.config -print -quit)
     if [[ -n $cfg ]]; then
         exe=$(grep -aoi '<Executable [^>]*>' "$cfg" | grep -ai 'Scarlett' | head -n1)
         [[ -n $exe ]] || exe=$(grep -aoi '<Executable [^>]*>' "$cfg" | head -n1)
@@ -259,7 +259,7 @@ game_exe() {
         [[ -n $exe && -f $dir/$exe ]] && { printf '%s' "$exe"; return; }
     fi
     local exes=()
-    mapfile -t exes < <(find "$dir" -maxdepth 1 -iname '*.exe' -printf '%f\n')
+    mapfile -t exes < <(find "$dir/" -maxdepth 1 -iname '*.exe' -printf '%f\n')
     ((${#exes[@]} == 1)) && { printf '%s' "${exes[0]}"; return; }
     return 1
 }
@@ -318,6 +318,7 @@ require_game() {
         GAME_DIR=$(game_dir)
     fi
     check_game_dir "$GAME_DIR"
+    GAME_DIR=$(realpath "$GAME_DIR")   # bubblewrap cannot mount over a symlink
     GAME_EXE=$(game_exe "$GAME_DIR")
 }
 
@@ -680,7 +681,7 @@ run_game() {
         warn "no patched wineserver for $(proton_tag): busy scenes will be many times slower (build it with: victory-proton wineserver)"
     fi
     info "starting $GAME_EXE (the window is called VIctory)"
-    launch run "$(winpath "$GAME_DIR/$GAME_EXE")" --execute "${args[@]}"
+    launch run run "$(winpath "$GAME_DIR/$GAME_EXE")" --execute "${args[@]}"
 }
 
 # ---------------------------------------------------------------- status
