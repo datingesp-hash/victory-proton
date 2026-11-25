@@ -2,8 +2,6 @@
 
 Run Xbox Series games on Linux with [VIctory](https://github.com/Marvisak/VIctory), or with any fork of it, through GE-Proton.
 
-VIctory is a Windows program that runs Xbox Series (GDK) games on a PC. `victory-proton` handles the rest on Linux:
-
 - It keeps VIctory, or the fork you choose, up to date and builds it for Windows from Linux.
 - It runs VIctory under GE-Proton's wine and vkd3d-proton.
 - It sets up what Linux needs to behave like Windows here.
