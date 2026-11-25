@@ -1,6 +1,6 @@
 # victory-proton
 
-Run Xbox Series games on Linux with [VIctory](https://github.com/Marvisak/VIctory), or with any fork of it, through GE-Proton.
+Run [VIctory](https://github.com/Marvisak/VIctory), or any fork of it, through GE-Proton using only one command.
 
 - It keeps VIctory, or the fork you choose, up to date and builds it for Windows from Linux.
 - It runs VIctory under GE-Proton's wine and vkd3d-proton.
