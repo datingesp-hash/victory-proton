@@ -43,6 +43,9 @@ pkg_hint() {
         widl)       arch=wine deb=wine64-tools fed=wine-devel suse=wine-devel ;;
         ninja)      arch=ninja deb=ninja-build fed=ninja-build suse=ninja ;;
         python3)    arch=python deb=python3-venv fed=python3 suse=python3 ;;
+        lld-link)   arch=lld deb=lld fed=lld suse=lld ;;
+        setcap|getcap) arch=libcap deb=libcap2-bin fed=libcap suse=libcap-progs ;;
+        cc)         arch=base-devel deb=build-essential fed=gcc suse=gcc ;;
         *)          arch=$cmd deb=$cmd fed=$cmd suse=$cmd ;;
     esac
     if command -v pacman >/dev/null; then echo "sudo pacman -S --needed $arch"
@@ -76,8 +79,23 @@ add_builtin joshuu https://github.com/JoshuuDev/victory-amd victory-amd "VICTORY
     "fork of myokex; fixes DirectStorage reads into guarded memory"
 add_builtin copperearth https://github.com/Copperearth/VIctory-wineless main "VP_NATIVE=1 VICTORY_NO_WATCHDOG=1" \
     "native Linux runtime, no wine"
-BUILTINS=(upstream fxceless myokex joshuu copperearth)
-DEFAULT_PROFILE=fxceless
+# The settings of its linux/victory-proton.sh (the fork's fast mode, renderer
+# ports 1/2/5/6/7, no 30 fps cap). It needs the patched wineserver and the
+# huge pages of its linux/thp/ to reach its numbers (~17-19 fps in the world).
+KROEEEE_ENV="VICTORY_TEXTURE_NO_WAIT=1 VICTORY_RELAY=2 VICTORY_WIDE_BACK=1 VICTORY_CARD_REHASH_RUNS=1
+    VICTORY_JOIN_COPIES=1 VICTORY_INDIRECT_WINDOW=1 VICTORY_RELAY_COPY=1 VICTORY_CARD_STEPS=2
+    VICTORY_INDIRECT_BATCH=2 VICTORY_MAP_THREADS=1 VICTORY_TITLE_PRIORITIES=0 VICTORY_CARD_AWAKE=1
+    VICTORY_SHOW_AFTER=1 VICTORY_AMBIENT=0.8 VICTORY_D3D12_DRED=light VICTORY_SKIP_PIPELINES=none
+    VICTORY_THIN=1 VICTORY_JOIN_PARTS=8 VICTORY_UPLOAD_AHEAD=1
+    VICTORY_PORT_DESCRIPTORS=1 VICTORY_PORT_GUARD=1 VICTORY_PORT_JOURNAL=1 VICTORY_PORT_CBV=1
+    VICTORY_PORT_CONSTANTS=1 VICTORY_COPY_COMPARE=1 VICTORY_ONE_PAD=0 VICTORY_FRAME_INTERVAL_MS=0
+    VKD3D_CONFIG= SDL_GAMECONTROLLER_IGNORE_DEVICES=0x0000/0x0000 SDL_JOYSTICK_IGNORE_DEVICES=0x0000/0x0000"
+add_builtin kroeeee https://github.com/kroeeee-eeee/VIctory-Linux-Proton-Wine-7900XT-XTX main "${KROEEEE_ENV//$'\n'/ }" \
+    "made for Linux/Proton on AMD RDNA 3 (7900 XT/XTX); the fastest here"
+# The GPU a profile was made for; others get a warning, not a refusal.
+declare -A P_GPU=([kroeeee]=amd)
+BUILTINS=(upstream fxceless myokex joshuu copperearth kroeeee)
+DEFAULT_PROFILE=kroeeee
 
 if [[ -f $PROFILES_FILE ]]; then
     while read -r name url branch env; do
@@ -221,7 +239,7 @@ else EXE=$SRC/target/$TARGET/release/victory.exe; fi
 VKD3D_SRC=$DATA/vkd3d-proton/src     # native vkd3d-proton: source,
 VKD3D_DIR=$DATA/vkd3d-proton/install # and where it is installed
 # A running game's command line, the wine build or the native one.
-PROC_RE='release/victory(\.exe)? run'
+PROC_RE='release[/\\]victory(\.exe)? run'
 
 # ---------------------------------------------------------------- GPU
 # nvidia, amd or intel: the vendor of the GPU the game most likely runs on (a
@@ -243,10 +261,14 @@ gpu_vendor() {
 # GPU minutes into the world (fxceless/victory-fork#3); skip it.
 AMD_ENV="VICTORY_SKIP_PIPELINES=fc5e66f8f873d3bb"
 
-# The profile's variables, and the AMD ones on AMD.
+# The profile's variables, and the AMD ones on AMD (unless the profile sets
+# the same variable itself).
 profile_vars() {
-    local all=${P_ENV[$PROFILE]:-}
-    [[ $(gpu_vendor) == amd ]] && all+=" $AMD_ENV"
+    local all kv
+    all=$(xargs <<<"${P_ENV[$PROFILE]:-}")
+    if [[ $(gpu_vendor) == amd ]]; then
+        for kv in $AMD_ENV; do [[ " $all" == *" ${kv%%=*}="* ]] || all+=" $kv"; done
+    fi
     printf '%s' "${all# }"
 }
 # Exports them, except those set already (yours win).
@@ -427,11 +449,61 @@ install_proton() {
 # red-black tree as well: about 10 us a call. The server must come from
 # exactly the tree of the Proton in use (same protocol), so it is built from
 # that GE-Proton release's own sources.
+#
+# Wine always execs the wineserver in its own bin/ folder (it finds it from
+# where ntdll.so really is, so a symlink does not do). So the game runs with a
+# copy of the GE-Proton release, hard links where the filesystem allows,
+# whose files/bin/wineserver is the patched one: $DATA/proton-vt/<tag>-vt.
 wineserver_path() { printf '%s/wineserver/%s-viewtree' "$DATA" "$(proton_tag)"; }
 
+# The wineserver to use: VP_WINESERVER, else the patched one if built, else
+# none (Proton's own). VP_WINESERVER=0 forces Proton's own.
+wanted_wineserver() {
+    if [[ ${VP_WINESERVER:-} == 0 ]]; then return 0; fi
+    if [[ -n ${VP_WINESERVER:-} ]]; then printf '%s' "$VP_WINESERVER"; return 0; fi
+    [[ -x $(wineserver_path) ]] && wineserver_path
+    return 0
+}
+
+# Points PROTON_DIR at the copy of the current GE-Proton that has wineserver
+# $1 in it, making (or refreshing) the copy first.
+use_wineserver() {
+    local ws=$1 tag dst tmp
+    [[ -x $ws ]] || die "wineserver $ws is not executable"
+    tag=$(proton_tag)
+    dst=$DATA/proton-vt/$tag-vt
+    if ! cmp -s "$ws" "$dst/files/bin/wineserver"; then
+        info "making $dst: $tag with the patched wineserver (hard links, next to no space)"
+        tmp=$dst.tmp
+        rm -rf "$tmp"
+        mkdir -p "$DATA/proton-vt"
+        cp -al "$PROTON_DIR" "$tmp" 2>/dev/null || { rm -rf "$tmp"; cp -a --reflink=auto "$PROTON_DIR" "$tmp"; } \
+            || die "cannot copy $PROTON_DIR to $tmp"
+        rm -f "$tmp/files/bin/wineserver"   # a hard link: never write through it
+        cp "$ws" "$tmp/files/bin/wineserver"
+        rm -rf "$dst"
+        mv "$tmp" "$dst"
+    fi
+    PROTON_DIR=$dst
+}
+
+# Builds the patched wineserver now when it is missing (once per GE-Proton
+# release, 10-20 min). Never fatal: the game runs with the stock one if the
+# build fails.
+ensure_wineserver() {
+    [[ ${VP_WINESERVER:-} == 0 || -n ${VP_WINESERVER:-} ]] && return 0
+    [[ -x $(wineserver_path) ]] && return 0
+    info "building the patched wineserver for $(proton_tag), once per GE-Proton release (10-20 min; VP_WINESERVER=0 skips it)"
+    if ! VP_PROTON=$PROTON_DIR "$REPO_DIR/victory-proton" wineserver; then
+        warn "could not build the patched wineserver; running with Proton's own (busy scenes will be about half as fast)"
+    fi
+    return 0
+}
+
+WS_DEPS=(git patch autoreconf bison flex make gcc perl)
 build_wineserver() {
     find_proton
-    need git patch autoreconf bison flex make gcc perl
+    need "${WS_DEPS[@]}"
     local tag; tag=$(proton_tag)
     [[ $tag == GE-Proton* ]] || die "only GE-Proton is supported here (have: ${tag:-?})"
     local root=$DATA/wineserver/build-$tag out; out=$(wineserver_path)
@@ -491,6 +563,7 @@ build_wineserver() {
         || die "the build failed; see $root/build/make.log"
     install -Dm755 "$root/build/server/wineserver" "$out"
     info "done: $out (used automatically with $tag; VP_WINESERVER=0 turns it off)"
+    info "the build tree $root (~1 GB) is not needed any more; delete it to free the space"
 }
 
 # ---------------------------------------------------------------- update
@@ -658,6 +731,76 @@ d3dcompiler() {
     return 0
 }
 
+# ---------------------------------------------------------------- huge pages
+# Profiles whose tree has linux/thp/victory-thp-collapse.c (kroeeee's): its
+# renderer port 1 opens a ~185 MB heap of the title as a GPU userptr, and
+# amdgpu walks it page by page on every submission. As 2 MiB transparent huge
+# pages that walk is 512 times shorter (~9 -> ~18 fps). A small helper
+# collapses those ranges, named in the log, from outside the process every
+# 15 s (process_madvise MADV_COLLAPSE). It needs CAP_SYS_NICE, given once with
+# sudo by `victory-proton thp` (setup does it). VICTORY_THP=0 turns it off.
+thp_src() { [[ -f $SRC/linux/thp/victory-thp-collapse.c ]] && printf '%s' "$SRC/linux/thp/victory-thp-collapse.c"; }
+THP_HELPER=$DATA/thp/victory-thp-collapse
+thp_has_cap() { command -v getcap >/dev/null && getcap "$THP_HELPER" 2>/dev/null | grep -q cap_sys_nice; }
+# Builds the helper when its source changed (a rebuild drops the capability).
+thp_build() {
+    local src; src=$(thp_src) || return 1
+    command -v cc >/dev/null || return 1
+    local tmp; tmp=$(mktemp)
+    cc -O2 -o "$tmp" "$src" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    if cmp -s "$tmp" "$THP_HELPER"; then rm -f "$tmp"; return 0; fi
+    mkdir -p "$(dirname "$THP_HELPER")"
+    mv "$tmp" "$THP_HELPER"
+    chmod 755 "$THP_HELPER"
+}
+thp_ready() { [[ ${VICTORY_THP:-1} != 0 ]] && ((!NATIVE)) && [[ -n $(thp_src) ]] && thp_has_cap; }
+thp_setup() {
+    [[ -n $(thp_src) ]] || die "profile $PROFILE has no huge-page helper (linux/thp/ in its tree; run or update it first)"
+    need cc setcap getcap
+    thp_build || die "cannot build $(thp_src)"
+    if thp_has_cap; then info "huge pages: ready ($THP_HELPER has CAP_SYS_NICE)"; return; fi
+    info "giving $THP_HELPER the one capability it needs (CAP_SYS_NICE, not root); sudo asks for your password"
+    sudo setcap cap_sys_nice+ep "$THP_HELPER" || die "setcap failed"
+    thp_has_cap || die "$THP_HELPER still has no CAP_SYS_NICE (is $DATA on a nosuid filesystem?)"
+    info "huge pages: ready"
+}
+thp_hint() {
+    [[ ${VICTORY_THP:-1} == 0 || -z $(thp_src) ]] && return 0
+    thp_build || true
+    thp_has_cap || warn "huge pages are off, about half the frame rate in the world: run once 'victory-proton thp' (asks for sudo)"
+    return 0
+}
+# Every 15 s: the game's process (the matching one with the most threads),
+# the ranges the log names, the helper on them. Results in <log>.thp.
+thp_watch() {
+    trap - ERR
+    set +eu +o pipefail
+    local log=$1 out=${1%.log}.thp pid ranges r last= p
+    while kill -0 $$ 2>/dev/null; do
+        sleep 15
+        pid=$(for p in $(pgrep -f "$PROC_RE"); do echo "$(ls /proc/"$p"/task 2>/dev/null | wc -l) $p"; done \
+            | sort -rn | awk 'NR==1{print $2}')
+        [[ -n $pid ]] || continue
+        # (the log may carry ANSI colours between a field's name and its value)
+        ranges=$(sed 's/\x1b\[[0-9;]*m//g' "$log" 2>/dev/null \
+            | grep -aoE "32-bit heap are private memory.*at=0x[0-9a-f]+ len=[0-9]+" \
+            | sed -E 's/.*at=0x([0-9a-f]+) len=([0-9]+)/\1 \2/' | sort -u \
+            | while read -r a l; do printf '%x %x ' $((16#$a)) $((16#$a + l)); done)
+        [[ -n $ranges ]] || continue
+        # shellcheck disable=SC2086
+        r=$("$THP_HELPER" "$pid" $ranges 2>&1)
+        if [[ $r != "$last" ]]; then echo "$(date +%T) $r" >>"$out"; last=$r; fi
+    done
+}
+
+gpu_check() {
+    local want=${P_GPU[$PROFILE]:-} have
+    [[ -n $want ]] || return 0
+    have=$(gpu_vendor)
+    [[ $have == "$want" ]] || warn "profile $PROFILE is made and tested for $want GPUs (you have: $have); if it does not work, try another: victory-proton profile"
+    return 0
+}
+
 # ---------------------------------------------------------------- run
 running() { pgrep -f "$PROC_RE" >/dev/null; }
 
@@ -675,6 +818,10 @@ launch() {
     require_game
     mkdir -p "$PDATA/cache" "$PDATA/data" "$PDATA/logs"
 
+    # The profile's variables first (yours win over them), then the defaults
+    # for what neither set.
+    local penv; penv=$(profile_vars)
+    export_profile_vars
     export WINEPREFIX=$DATA/prefix/pfx
     export WINEDLLOVERRIDES=${WINEDLLOVERRIDES:-"d3d12,d3d12core,dxgi,d3d11,d3d10core,d3d9,d3dcompiler_47=n,b"}
     export WINEDEBUG=${WINEDEBUG:--all}
@@ -683,8 +830,6 @@ launch() {
     # heaps at 1,000,000 descriptors; titles that ask for more fault the GPU.
     export VKD3D_CONFIG=${VKD3D_CONFIG-descriptor_heap}
     export RUST_LOG=${RUST_LOG:-info}
-    local penv; penv=$(profile_vars)
-    export_profile_vars
 
     local sandbox=()
     if sandbox_ok; then
@@ -694,21 +839,14 @@ launch() {
     else
         warn "running without the sandbox: the game folder is not protected"
     fi
-    # The patched wineserver (see "wineserver" above). Wine always execs the
-    # one next to it, but uses one already running for the prefix: so stop
-    # any, and start ours first, inside the sandbox (the server opens files
-    # for the title, so it must see the game folder read-only too).
-    local server=()
-    if [[ -z ${VP_WINESERVER+x} && -x $(wineserver_path) ]]; then
-        VP_WINESERVER=$(wineserver_path)
-    elif [[ ${VP_WINESERVER:-} == 0 ]]; then
-        VP_WINESERVER=
-    fi
-    if [[ -n ${VP_WINESERVER:-} ]]; then
-        [[ -x $VP_WINESERVER ]] || die "VP_WINESERVER=$VP_WINESERVER is not executable"
-        "$PROTON_DIR/files/bin/wineserver" -k 2>/dev/null || true
-        server=(sh -c '"$0" -p5 || exit 1; exec "$@"' "$VP_WINESERVER")
-    fi
+    # The patched wineserver (see "wineserver" above), through the copy of
+    # Proton that has it. Wine reuses a server already running for the
+    # prefix, so stop any: the one wine starts now runs inside the sandbox
+    # (it opens files for the title, so it must see the game folder
+    # read-only too) and is the right one.
+    local ws; ws=$(wanted_wineserver)
+    [[ -n $ws ]] && use_wineserver "$ws"
+    "$PROTON_DIR/files/bin/wineserver" -k 2>/dev/null || true
     export VICTORY_GAME_DIR VICTORY_CACHE_DIR VICTORY_DATA_DIR
     VICTORY_GAME_DIR=$(winpath "$GAME_DIR")
     VICTORY_CACHE_DIR=$(winpath "$PDATA/cache")
@@ -719,14 +857,17 @@ launch() {
     local log; log=$PDATA/logs/$(date +%Y%m%d-%H%M%S)-$label.log
     ln -sfn "$(basename "$log")" "$PDATA/logs/latest.log"
     ln -sfn "profiles/$PROFILE/logs/$(basename "$log")" "$DATA/latest.log"
-    info "profile $PROFILE ($(git -C "$SRC" log -1 --format=%h 2>/dev/null || echo '?')), $(proton_tag), wineserver: ${VP_WINESERVER:-stock}"
+    info "profile $PROFILE ($(git -C "$SRC" log -1 --format=%h 2>/dev/null || echo '?')), $(proton_tag), wineserver: ${ws:-stock}"
     [[ -n $penv ]] && info "with $penv"
     info "log: $log"
+    local thp_pid=
+    if thp_ready; then thp_watch "$log" & thp_pid=$!; fi
     cd "$PDATA"
     set +e
-    ${sandbox[@]+"${sandbox[@]}"} ${server[@]+"${server[@]}"} ${wrap[@]+"${wrap[@]}"} \
+    ${sandbox[@]+"${sandbox[@]}"} ${wrap[@]+"${wrap[@]}"} \
         "$PROTON_DIR/files/bin/wine" "$EXE" "$@" 2>&1 | tee "$log"
     local rc=${PIPESTATUS[0]}
+    [[ -n $thp_pid ]] && kill "$thp_pid" 2>/dev/null
     set -e
     info "victory.exe exited with code $rc$( ((rc > 128)) && printf ' (signal %d)' $((rc - 128)))" 2>&1 | tee -a "$log" >&2
     grep -aq 'GPUVM fault' "$log" && warn "the GPU faulted (GPUVM fault); see the README, \"Troubleshooting\""
@@ -742,11 +883,11 @@ launch_native() {
     mkdir -p "$PDATA/cache" "$PDATA/data" "$PDATA/logs"
     export VICTORY_VKD3D=${VICTORY_VKD3D:-$(vkd3d_lib)}
     [[ -n $VICTORY_VKD3D ]] || die "native vkd3d-proton is missing (victory-proton vkd3d)"
+    local penv; penv=$(profile_vars)
+    export_profile_vars
     export VKD3D_CONFIG=${VKD3D_CONFIG-descriptor_heap}
     export VKD3D_SHADER_CACHE_PATH=${VKD3D_SHADER_CACHE_PATH:-$PDATA}
     export RUST_LOG=${RUST_LOG:-info}
-    local penv; penv=$(profile_vars)
-    export_profile_vars
     local sandbox=()
     if sandbox_ok; then
         sandbox=(bwrap --dev-bind / / --ro-bind "$GAME_DIR" "$GAME_DIR" --)
@@ -785,6 +926,7 @@ run_game() {
         shift
     done
     running && die "VIctory is running already; close it first (victory-proton kill)"
+    gpu_check
     require_game
     ((do_update)) && update
     build
@@ -797,9 +939,8 @@ run_game() {
     prefix
     d3dcompiler
     ((do_update)) && check_proton
-    if [[ -z ${VP_WINESERVER+x} && ! -x $(wineserver_path) ]]; then
-        warn "no patched wineserver for $(proton_tag): busy scenes will be many times slower (build it with: victory-proton wineserver)"
-    fi
+    ensure_wineserver
+    thp_hint
     info "starting $GAME_EXE (the window is called VIctory)"
     launch run run "$(winpath "$GAME_DIR/$GAME_EXE")" --execute "${args[@]}"
 }
@@ -819,7 +960,10 @@ status() {
         PROTON_DIR=$( (find_proton 2>/dev/null; printf '%s' "$PROTON_DIR") || true)
         if [[ -n $PROTON_DIR ]]; then
             printf 'proton      %s  %s\n' "$(proton_tag)" "$PROTON_DIR"
-            printf 'wineserver  %s\n' "$([[ -x $(wineserver_path) ]] && echo "$ok patched" || echo "$no stock (victory-proton wineserver)")"
+            printf 'wineserver  %s\n' "$([[ -n $(wanted_wineserver) ]] && echo "$ok patched ($(wanted_wineserver))" || echo "$no stock (built on the next run, or: victory-proton wineserver)")"
+            if [[ -n $(thp_src) ]]; then
+                printf 'huge pages  %s\n' "$(thp_has_cap && echo "$ok ($THP_HELPER)" || echo "$no off (victory-proton thp)")"
+            fi
         else printf 'proton      %s (victory-proton proton)\n' "$no"; fi
         printf 'd3dcompiler %s\n' "$(d3dcompiler_native && echo "$ok Microsoft's" || echo "$no wine's (installed on the next run)")"
     fi
@@ -832,7 +976,8 @@ status() {
 
 # ---------------------------------------------------------------- setup
 setup() {
-    need git curl bwrap winetricks
+    need git curl bwrap winetricks clang lld-link
+    ((NATIVE)) || need "${WS_DEPS[@]}"
     if ! command -v rustup >/dev/null; then
         info "installing rustup into ~/.cargo (your PATH and shell profile are left alone)"
         curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none --profile minimal
@@ -857,7 +1002,13 @@ setup() {
         ln -s "$REPO_DIR/victory-proton" "$HOME/.local/bin/victory-proton"
         info "linked ~/.local/bin/victory-proton to this script"
     fi
-    [[ -x $(wineserver_path) ]] || info "recommended next: victory-proton wineserver (10-20 min once per GE-Proton release)"
+    if ((!NATIVE)); then
+        ensure_wineserver
+        if [[ -n $(thp_src) && ${VICTORY_THP:-1} != 0 ]] && ! thp_has_cap; then
+            if [[ -t 0 ]]; then thp_setup || warn "huge pages stay off; 'victory-proton thp' tries again"
+            else warn "huge pages are off: run 'victory-proton thp' once (asks for sudo)"; fi
+        fi
+    fi
     info "ready. Run: victory-proton"
 }
 
@@ -876,7 +1027,8 @@ victory-proton: run Xbox Series titles with VIctory on Linux, through GE-Proton
                                                     add a fork (github.com/o/r/tree/branch works)
   victory-proton profile remove NAME
   victory-proton -p NAME|URL ...                    use another profile for one command
-  victory-proton wineserver  build the faster wineserver for your GE-Proton (recommended)
+  victory-proton wineserver  build the faster wineserver for your GE-Proton (run does it once by itself)
+  victory-proton thp      set up huge pages for profiles that use them (kroeeee; asks for sudo once)
   victory-proton vkd3d    build native vkd3d-proton, for native profiles (done on first run)
   victory-proton proton [TAG]  install the newest GE-Proton (or TAG)
   victory-proton update | build   only update, or only build
@@ -898,6 +1050,7 @@ case $cmd in
     game)       game_cmd "$@" ;;
     profile|profiles) profile_cmd "$@" ;;
     wineserver) build_wineserver ;;
+    thp)        thp_setup ;;
     vkd3d)      build_vkd3d ;;
     proton)     install_proton "$@" ;;
     update)     update ;;

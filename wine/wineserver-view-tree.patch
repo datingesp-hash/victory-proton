@@ -121,7 +121,7 @@ index b9b1b63..030e4a1 100644
      LIST_FOR_EACH_ENTRY( view, &process->views, struct memory_view, entry )
      {
          if (view->base + view->size <= addr) continue;
-@@ -491,6 +568,11 @@ static int add_process_view( struct thread *thread, struct memory_view *view )
+@@ -491,6 +568,17 @@ static int add_process_view( struct thread *thread, struct memory_view *view )
  {
      struct process *process = thread->process;
      struct unicode_str name;
@@ -129,7 +129,13 @@ index b9b1b63..030e4a1 100644
 +
 +    view->process = process;
 +    view->in_tree = !rb_put( &view_tree, &key, &view->tree_entry );
-+    if (!view->in_tree) view_tree_unreliable = 1;
++    if (!view->in_tree)
++    {
++        if (!view_tree_unreliable)
++            fprintf( stderr, "wineserver view tree: two views at base %#llx (size %#llx, flags %#x); falling back to the list\n",
++                     (unsigned long long)view->base, (unsigned long long)view->size, view->flags );
++        view_tree_unreliable = 1;
++    }
  
      if (view->flags & SEC_IMAGE)
      {
