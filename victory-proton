@@ -213,8 +213,8 @@ profile_proton_cmd() {
     printf '%s %s\n' "$name" "$which" >>"$tmp"
     mv "$tmp" "$PROTONS_FILE"
     info "profile $name now runs with ${dir:-$which (installed on its next run)}, in a wine prefix of its own"
-    if [[ -n $dir && $(proton_tag "$dir") != GE-Proton* ]]; then
-        warn "not a GE-Proton: it runs with its own wineserver (the patched one is built for GE-Proton only)"
+    if [[ -n $dir ]] && ! proton_source "$(proton_tag "$dir" | sed 's/-x86_64.*//')" >/dev/null; then
+        warn "no known sources for $(proton_tag "$dir"): it runs with its own wineserver (VP_PROTON_SRC=OWNER/REPO if it is built like GE-Proton)"
     fi
     return 0
 }
@@ -602,8 +602,8 @@ use_wineserver() {
 ensure_wineserver() {
     [[ ${VP_WINESERVER:-} == 0 || -n ${VP_WINESERVER:-} ]] && return 0
     [[ -x $(wineserver_path) ]] && return 0
-    if [[ $(proton_tag) != GE-Proton* ]]; then
-        warn "the patched wineserver is built for GE-Proton only; $(proton_tag) runs with its own (busy scenes about half as fast)"
+    if ! proton_source "$(proton_tag | sed 's/-x86_64.*//')" >/dev/null; then
+        warn "no known sources for $(proton_tag), so no patched wineserver: it runs with its own (busy scenes about half as fast; VP_PROTON_SRC=OWNER/REPO if it is built like GE-Proton)"
         return 0
     fi
     info "building the patched wineserver for $(proton_tag), once per GE-Proton release (10-20 min; VP_WINESERVER=0 skips it)"
@@ -631,60 +631,125 @@ find_ws_patch() {
 }
 
 WS_DEPS=(git patch autoreconf bison flex make gcc perl)
+
+# Where a Proton's sources are, from the tag in its version file:
+# "REPO PREP". Each release is a git tag there with wine as a submodule.
+# PREP is how that Proton patches wine before building it: "ge" (the `pushd
+# wine` section of patches/protonprep-valve-staging.sh, GE and UMU),
+# "dir" (patches/wine/*.patch if there, CachyOS), or "none" (Valve: the
+# patches are commits in its wine). VP_PROTON_SRC=OWNER/REPO [PREP] names it
+# for another Proton built the same way.
+proton_source() {
+    local tag=$1
+    if [[ -n ${VP_PROTON_SRC:-} ]]; then
+        local repo prep; read -r repo prep <<<"$VP_PROTON_SRC"
+        printf '%s %s' "$repo" "${prep:-ge}"; return
+    fi
+    case $tag in
+        GE-Proton*)              echo "$GE_REPO ge" ;;
+        UMU-Proton*)             echo "Open-Wine-Components/umu-proton ge" ;;
+        experimental-*|proton-*) echo "ValveSoftware/Proton none" ;;
+        cachyos-*)               echo "CachyOS/proton-cachyos dir" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Starts the Proton copy with wineserver $1 on a throwaway prefix: wine
+# refuses a server whose protocol is not its own ("version mismatch").
+check_wineserver() {
+    local ws=$1 tmp out rc=0
+    use_wineserver "$ws"
+    tmp=$(mktemp -d "$DATA/wineserver/check.XXXXXX")
+    info "checking it against $(proton_tag)'s wine (a throwaway prefix, up to a minute)"
+    out=$(env -u DISPLAY -u WAYLAND_DISPLAY WINEPREFIX="$tmp/pfx" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=" \
+        timeout 180 "$PROTON_DIR/files/bin/wine" cmd /c exit 2>&1) || rc=$?
+    WINEPREFIX=$tmp/pfx "$PROTON_DIR/files/bin/wineserver" -k 2>/dev/null || true
+    rm -rf "$tmp"
+    if grep -qi 'version mismatch' <<<"$out"; then return 1; fi
+    ((rc == 0)) || warn "the check did not finish cleanly (code $rc), but wine took the server"
+    return 0
+}
+
 build_wineserver() {
     find_proton
     need "${WS_DEPS[@]}"
+    local tag; tag=$(proton_tag)
+    local src_tag=${tag%-x86_64*}   # Valve's version files add the architecture
+    local repo prep
+    read -r repo prep <<<"$(proton_source "$src_tag")" \
+        || die "no known sources for ${tag:-this Proton} ($PROTON_DIR). GE-Proton, Steam's Protons, Proton-CachyOS and UMU-Proton are supported; for another one built the same way set VP_PROTON_SRC=OWNER/REPO"
     find_ws_patch
     info "patch: $WS_PATCH"
-    local tag; tag=$(proton_tag)
-    [[ $tag == GE-Proton* ]] || die "only GE-Proton is supported here (have: ${tag:-?})"
     local root=$DATA/wineserver/build-$tag out; out=$(wineserver_path)
-    info "building wineserver with the view-tree patch for $tag (in $root, ~1 GB)"
+    local top=$root/proton
+    info "building wineserver with the view-tree patch for $tag from github.com/$repo (in $root, ~1 GB)"
     mkdir -p "$root"
-    if [[ ! -d $root/ge/.git ]]; then
-        git init -q "$root/ge"
-        git -C "$root/ge" remote add origin "https://github.com/$GE_REPO"
+    [[ -d $root/ge/.git && ! -d $top ]] && mv "$root/ge" "$top"   # older builds' folder name
+    if [[ ! -d $top/.git || $(git -C "$top" remote get-url origin 2>/dev/null) != "https://github.com/$repo" ]]; then
+        rm -rf "$top"
+        git init -q "$top"
+        git -C "$top" remote add origin "https://github.com/$repo"
     fi
-    git -C "$root/ge" fetch -q --depth 1 origin tag "$tag"
-    git -C "$root/ge" checkout -q -f "$tag"
+    git -C "$top" fetch -q --depth 1 origin tag "$src_tag" || die "github.com/$repo has no tag $src_tag"
+    git -C "$top" checkout -q -f "$src_tag"
     local m url sha
     for m in wine wine-staging; do
-        url=$(git -C "$root/ge" config -f .gitmodules "submodule.$m.url")
-        sha=$(git -C "$root/ge" ls-tree HEAD "$m" | awk '{print $3}')
-        if [[ $(git -C "$root/ge/$m" rev-parse HEAD 2>/dev/null) != "$sha" ]]; then
+        sha=$(git -C "$top" ls-tree HEAD "$m" | awk '$2 == "commit" {print $3}')
+        if [[ -z $sha ]]; then
+            [[ $m == wine ]] && die "$repo $src_tag has no wine submodule"
+            continue
+        fi
+        url=$(git -C "$top" config -f .gitmodules "submodule.$m.url")
+        [[ $url == ../* ]] && url=https://github.com/${repo%%/*}/${url#../}   # relative to the repository
+        if [[ $(git -C "$top/$m" rev-parse HEAD 2>/dev/null) != "$sha" ]]; then
             info "fetching $m ($sha)"
-            rm -rf "${root:?}/ge/$m"
-            git init -q "$root/ge/$m"
-            git -C "$root/ge/$m" remote add origin "$url"
-            git -C "$root/ge/$m" fetch -q --depth 1 origin "$sha"
-            git -C "$root/ge/$m" checkout -q FETCH_HEAD
+            rm -rf "${top:?}/$m"
+            git init -q "$top/$m"
+            git -C "$top/$m" remote add origin "$url"
+            git -C "$top/$m" fetch -q --depth 1 origin "$sha" || die "cannot fetch $m $sha from $url"
+            git -C "$top/$m" checkout -q FETCH_HEAD
+        else
+            git -C "$top/$m" reset -q --hard && git -C "$top/$m" clean -qfdx   # undo the last build's patching
         fi
     done
-    # GE's own patching of wine: the helpers and the `pushd wine` section of
-    # its prep script (which starts with a git reset --hard/clean of wine/).
-    local prep=$root/ge/patches/protonprep-valve-staging.sh
-    [[ -f $prep ]] || die "$prep not found; GE may have changed its layout"
-    {
-        sed -n '/^apply_patch()/,/^}/p;/^apply_all_in_dir()/,/^}/p' "$prep"
-        awk '/^[[:space:]]*pushd wine$/ {on=1} on {print} on && /^[[:space:]]*popd/ {exit}' "$prep"
-    } >"$root/prep-wine.sh"
-    info "applying GE's patches to wine (log: $root/prep.log)"
-    (cd "$root/ge" && bash "$root/prep-wine.sh") >"$root/prep.log" 2>&1 || die "GE's patches failed; see $root/prep.log"
-    (cd "$root/ge/wine" && patch -p1 -s <"$WS_PATCH") || die "the view-tree patch does not apply to $tag; please open an issue"
+    case $prep in
+        ge)
+            # The helpers and the `pushd wine` section of its prep script.
+            local script=$top/patches/protonprep-valve-staging.sh
+            [[ -f $script ]] || die "$script not found; $repo may have changed its layout"
+            {
+                sed -n '/^apply_patch()/,/^}/p;/^apply_all_in_dir()/,/^}/p' "$script"
+                awk '/^[[:space:]]*pushd wine$/ {on=1} on {print} on && /^[[:space:]]*popd/ {exit}' "$script"
+            } >"$root/prep-wine.sh"
+            info "applying $repo's patches to wine (log: $root/prep.log)"
+            (cd "$top" && bash "$root/prep-wine.sh") >"$root/prep.log" 2>&1 || die "$repo's patches failed; see $root/prep.log"
+            ;;
+        dir)
+            local f
+            for f in $(find "$top/patches/wine" -name '*.patch' 2>/dev/null | sort); do
+                patch -d "$top/wine" -Np1 -s -i "$f" >>"$root/prep.log" 2>&1 || die "$f does not apply; see $root/prep.log"
+            done
+            ;;
+    esac
+    (cd "$top/wine" && patch -p1 -s <"$WS_PATCH") || die "the view-tree patch does not apply to $tag; please open an issue"
     info "configuring (wineserver only)"
     (
-        cd "$root/ge/wine"
+        cd "$top/wine"
+        # The server protocol's generated headers (Valve's wine does not keep
+        # them up to date in git); the same output when they are.
+        perl tools/make_requests >/dev/null 2>&1 || true
         tools/make_specfiles >/dev/null 2>&1 || true
         autoreconf -fi >/dev/null 2>&1
         # Vulkan's generated sources are not needed for the server; empty
         # stand-ins let configure write the Makefile without vk.xml.
         local f
-        for f in include/wine/vulkan.h dlls/winevulkan/{loader_thunks.c,loader_thunks.h,vulkan_thunks.c,vulkan_thunks.h,winevulkan.json,winevulkan.spec}; do
+        for f in include/wine/vulkan.h include/wine/vulkan_driver.h dlls/winevulkan/{loader_thunks.c,loader_thunks.h,vulkan_thunks.c,vulkan_thunks.h,winevulkan.json,winevulkan.spec}; do
             [[ -e $f ]] || : >"$f"
         done
     )
+    rm -rf "$root/build"
     mkdir -p "$root/build"
-    (cd "$root/build" && "$root/ge/wine/configure" --enable-archs=x86_64 --disable-tests \
+    (cd "$root/build" && "$top/wine/configure" --enable-archs=x86_64 --disable-tests \
         --without-x --without-wayland --without-vulkan --without-freetype --without-gstreamer \
         --without-pulse --without-alsa --without-oss --without-cups --without-sane --without-gphoto \
         --without-krb5 --without-netapi --without-pcap --without-usb --without-v4l2 --without-opencl \
@@ -693,7 +758,12 @@ build_wineserver() {
         || die "configure failed; see $root/build/configure.log"
     (cd "$root/build" && make -j"$(nproc)" server/wineserver >make.log 2>&1) \
         || die "the build failed; see $root/build/make.log"
-    install -Dm755 "$root/build/server/wineserver" "$out"
+    local new=$root/build/server/wineserver
+    if ! check_wineserver "$new"; then
+        rm -rf "$DATA/proton-vt/$tag-vt"
+        die "the built wineserver does not match $tag's wine (version mismatch); not used. Please open an issue"
+    fi
+    install -Dm755 "$new" "$out"
     info "done: $out (used automatically with $tag; VP_WINESERVER=0 turns it off)"
     info "the build tree $root (~1 GB) is not needed any more; delete it to free the space"
 }
@@ -1093,7 +1163,7 @@ status() {
         if [[ -n $PROTON_DIR ]]; then
             printf 'proton      %s  %s%s\n' "$(proton_tag)" "$PROTON_DIR" "$([[ -n $PROTON_WHICH ]] && echo "  (set: $PROTON_WHICH)")"
             printf 'prefix      %s\n' "$PREFIX_ROOT"
-            printf 'wineserver  %s\n' "$([[ -n $(wanted_wineserver) ]] && echo "$ok patched ($(wanted_wineserver))" || echo "$no stock ($([[ $(proton_tag) == GE-Proton* ]] && echo 'built on the next run, or: victory-proton wineserver' || echo 'the patched one is for GE-Proton only'))")"
+            printf 'wineserver  %s\n' "$([[ -n $(wanted_wineserver) ]] && echo "$ok patched ($(wanted_wineserver))" || echo "$no stock ($(proton_source "$(proton_tag | sed 's/-x86_64.*//')" >/dev/null && echo 'built on the next run, or: victory-proton wineserver' || echo 'no known sources for this Proton'))")"
             if [[ -n $(thp_src) ]]; then
                 printf 'huge pages  %s\n' "$(thp_has_cap && echo "$ok ($THP_HELPER)" || echo "$no off (victory-proton thp)")"
             fi

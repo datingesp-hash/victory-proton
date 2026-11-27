@@ -35,7 +35,7 @@ victory-proton                  # update, build and play
 3. Asks for your game folder.
 4. Clones and builds the default VIctory fork ([`kroeeee`](#choosing-a-victory-build-profiles)).
 5. Sets up a wine prefix.
-6. Builds the [faster wineserver](#how-it-works) for your GE-Proton (10-20 min, once per GE-Proton release).
+6. Builds the [faster wineserver](#how-it-works) for your Proton (10-20 min, once per Proton release).
 7. For profiles that use them (`kroeeee`), sets up [huge pages](#how-it-works): it asks for `sudo` once, to give one small helper the `CAP_SYS_NICE` capability.
 8. Links `~/.local/bin/victory-proton` to the script.
 
@@ -65,7 +65,7 @@ Things to know:
 
 - **What counts as a Proton:** any folder with a `proton` script and a `version` file: GE-Proton, Steam's Protons, Proton-CachyOS, UMU-Proton, or one you built yourself. They are looked for in Steam's `compatibilitytools.d` and `steamapps/common` (native and Flatpak), in `/usr/share/steam/compatibilitytools.d` and in this tool's own folder. Names don't depend on upper or lower case.
 - **Its own prefix:** a profile with its own Proton gets a wine prefix of its own (`~/.local/share/victory-proton/prefixes/<name>`), set up on its first run, so different wine versions never share one. Saves and caches stay per profile as always.
-- **The fast wineserver is for GE-Proton only.** With any other Proton the game runs with that Proton's own wineserver, and busy scenes are about half as fast. `status` tells you which one is in use.
+- **The fast wineserver works with GE-Proton, Steam's Protons (Experimental, 9.0, ...), Proton-CachyOS and UMU-Proton.** It is built for each release the first time a profile runs with it (10-20 min). A Proton built by yourself or from another project gets its own stock wineserver unless you say where its sources are: `VP_PROTON_SRC=OWNER/REPO` (a GitHub repository laid out like GE-Proton's, with each release as a tag). `status` tells you which wineserver is in use.
 - **For one run, or for every profile:** `VP_PROTON=experimental victory-proton` overrides it for that run. `VP_PROTON` in `~/.config/victory-proton/config` applies to all profiles.
 - For a fork you add, `VP_PROTON=...` among its variables does the same: `victory-proton profile add someone/fork NAME BRANCH VP_PROTON=GE-Proton10-34`.
 
@@ -155,7 +155,7 @@ To mark a fork you add as native: `victory-proton profile add someone/fork NAME 
 | `victory-proton game PATH` | set the game folder |
 | `victory-proton profile ...` | list, choose, add or remove profiles (see above) |
 | `victory-proton -p NAME\|URL COMMAND` | run any command with another profile |
-| `victory-proton wineserver` | build the faster wineserver for your GE-Proton now (a run does it by itself when it is missing; see [How it works](#how-it-works)) |
+| `victory-proton wineserver` | build the faster wineserver for the profile's Proton now (a run does it by itself when it is missing; see [How it works](#how-it-works)) |
 | `victory-proton thp` | set up huge pages for the profiles that use them (`kroeeee`): builds the helper and gives it `CAP_SYS_NICE` with `sudo`, once |
 | `victory-proton vkd3d` | build or update native vkd3d-proton (native profiles only) |
 | `victory-proton proton [TAG]` | install the newest GE-Proton, or the release `TAG` |
@@ -199,7 +199,7 @@ Xbox Series game ─▶ VIctory (victory.exe) ─▶ wine ─▶ vkd3d-proton �
 
 VIctory is built for `x86_64-pc-windows-msvc` with [cargo-xwin](https://github.com/rust-cross/cargo-xwin), which fetches the Windows SDK and CRT, so no Windows machine is needed. It runs with GE-Proton's `wine` directly, without going through Steam, in a prefix of its own. The launcher takes care of everything below that Linux needs to match Windows here.
 
-**1. A faster wineserver** (built by itself on the first run, once per GE-Proton release; it makes the biggest difference)
+**1. A faster wineserver** (built by itself on the first run, once per Proton release; it makes the biggest difference)
 
 - **The problem:** wineserver keeps each process's mapped memory views in a list and walks the whole list on every map and unmap. Some games alias GPU memory one 64 KiB page at a time, which gives over 20,000 views. Each map or unmap then costs 0.5-1 ms instead of microseconds, wineserver sits at most of a CPU core, and VIctory's texture uploads stall for seconds a frame.
 - **The fix:** [`wine/wineserver-view-tree.patch`](wine/wineserver-view-tree.patch) also indexes the views in a red-black tree. Each call drops to about 10 µs.
@@ -215,8 +215,8 @@ VIctory is built for `x86_64-pc-windows-msvc` with [cargo-xwin](https://github.c
 
   If two views ever share a base address, the server stops trusting the tree, goes back to the list and says so once in the log (`wineserver view tree: ... falling back to the list`).
 
-- **How it is built:** the server has to match the wine it runs with exactly. So the command fetches the sources of *your* GE-Proton release, applies GE's own wine patches and then this one, and builds only `wineserver`.
-- **How it is used:** wine always runs the wineserver in its own `bin/` folder and ignores `WINESERVER`. So the game runs with a copy of your GE-Proton, `VP_DATA/proton-vt/<release>-vt`, made of hard links (next to no disk space) except `files/bin/wineserver`, which is the patched one. Your GE-Proton itself is never changed. If the build fails, the game runs with the stock server and you get a warning.
+- **How it is built:** the server has to match the wine it runs with exactly. So the command fetches the sources of *your* Proton release (the tag its `version` file names, in GloriousEggroll/proton-ge-custom, ValveSoftware/Proton, CachyOS/proton-cachyos or Open-Wine-Components/umu-proton), applies that Proton's own wine patches and then this one, and builds only `wineserver`. Before it is used, it is started once with that Proton's wine on a throwaway prefix: if wine refuses it (`version mismatch`), it is thrown away and the game keeps the stock one.
+- **How it is used:** wine always runs the wineserver in its own `bin/` folder and ignores `WINESERVER`. So the game runs with a copy of your Proton, `VP_DATA/proton-vt/<release>-vt`, made of hard links (next to no disk space) except `files/bin/wineserver`, which is the patched one. Your Proton itself is never changed. If the build fails, the game runs with the stock server and you get a warning.
 
 **2. Huge pages** (profiles that ship `linux/thp/`, such as `kroeeee`). Renderer port 1 hands a ~185 MB heap of the title to the AMD kernel driver as a user pointer, and the driver checks it page by page on every submission. With 4 KiB pages that keeps one CPU core busy and the GPU waiting; as 2 MiB huge pages the check is 512 times shorter: about 9 → 18 fps in the same scene. Every 15 s while the game runs, the profile's small helper collapses those ranges (read from the log) into huge pages from outside the process (`process_madvise(MADV_COLLAPSE)`, Linux 6.1+). Their contents don't change. The helper needs one capability, `CAP_SYS_NICE` (not root), which `victory-proton thp` gives it with `sudo` once; it is rebuilt, and asks again, only when the fork changes it. Results are in a `.thp` file next to the run's log (`88 collapsed, 0 not`).
 
@@ -284,7 +284,7 @@ When you report a problem to a fork, include:
 
 - the log,
 - your GPU and driver,
-- your GE-Proton release,
+- your Proton release,
 - whether the patched wineserver and huge pages were in use (both in `status`).
 
 ## Credits
