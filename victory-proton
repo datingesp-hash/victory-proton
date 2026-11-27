@@ -18,7 +18,7 @@ PROFILES_FILE=$CONFIG_DIR/profiles   # profiles you added
 DEFAULT_FILE=$CONFIG_DIR/profile     # the default profile's name
 GAME_FILE=$CONFIG_DIR/game           # the game folder
 REPO_DIR=$(dirname "$(realpath "${BASH_SOURCE[0]}")")
-WS_PATCH=$REPO_DIR/wine/wineserver-view-tree.patch
+WS_PATCH_URL=https://raw.githubusercontent.com/datingesp-hash/victory-proton/main/wine/wineserver-view-tree.patch
 TARGET=x86_64-pc-windows-msvc
 SYNCED=refs/victory-proton/synced    # last upstream commit this script checked out
 GE_REPO=GloriousEggroll/proton-ge-custom
@@ -500,10 +500,29 @@ ensure_wineserver() {
     return 0
 }
 
+# The view-tree patch: next to this script (a clone of this repository), else
+# in the profile's own tree (forks that ship it in linux/wineserver/), else
+# downloaded from this repository (when only the script was copied).
+find_ws_patch() {
+    local f
+    for f in "$REPO_DIR/wine/wineserver-view-tree.patch" "$SRC/linux/wineserver/wineserver-view-tree.patch"; do
+        [[ -s $f ]] && { WS_PATCH=$f; return; }
+    done
+    WS_PATCH=$DATA/wineserver/wineserver-view-tree.patch
+    need curl
+    info "the view-tree patch is not next to this script; downloading it"
+    mkdir -p "$DATA/wineserver"
+    curl -fsSL --max-time 30 -o "$WS_PATCH.tmp" "$WS_PATCH_URL" && grep -q '^+++ .*server/mapping.c' "$WS_PATCH.tmp" \
+        || { rm -f "$WS_PATCH.tmp"; die "cannot download the view-tree patch ($WS_PATCH_URL); clone the whole repository instead of copying the script alone"; }
+    mv "$WS_PATCH.tmp" "$WS_PATCH"
+}
+
 WS_DEPS=(git patch autoreconf bison flex make gcc perl)
 build_wineserver() {
     find_proton
     need "${WS_DEPS[@]}"
+    find_ws_patch
+    info "patch: $WS_PATCH"
     local tag; tag=$(proton_tag)
     [[ $tag == GE-Proton* ]] || die "only GE-Proton is supported here (have: ${tag:-?})"
     local root=$DATA/wineserver/build-$tag out; out=$(wineserver_path)
