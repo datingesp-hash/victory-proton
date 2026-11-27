@@ -9,6 +9,7 @@ Run [VIctory](https://github.com/Marvisak/VIctory), or any fork of it, through G
 Your game folder is mounted **read-only** every time the game runs.
 
 - [Quick start](#quick-start)
+- [Using another Proton](#using-another-proton)
 - [Requirements](#requirements)
 - [Choosing a VIctory build (profiles)](#choosing-a-victory-build-profiles)
 - [Commands](#commands)
@@ -43,6 +44,30 @@ If you skip `setup`, plain `victory-proton` does the same on its first run, exce
 After that, plain `victory-proton` checks the repository for new commits, rebuilds if there are any, and starts the game.
 
 The first build takes a few minutes. The first run of every new build is slow too, because the shader cache is keyed to the build and gets rebuilt.
+
+Warnings such as `warning: function ... is never used` while it builds come from the fork's own code. They are harmless and you can ignore them.
+
+## Using another Proton
+
+By default every profile runs with the newest GE-Proton you have. You can give any profile its own Proton:
+
+```sh
+victory-proton proton list                         # every Proton found on this PC
+victory-proton profile proton fxceless experimental                # Steam's Proton - Experimental
+victory-proton profile proton joshuu proton-cachyos-11.0-20260601-slr-x86_64_v3   # a name from the list
+victory-proton profile proton myokex GE-Proton10-34               # a GE-Proton version (downloaded if missing)
+victory-proton profile proton upstream ~/my-protons/my-custom-proton   # any Proton folder
+victory-proton profile proton fxceless                             # show what that profile uses
+victory-proton profile proton fxceless default                     # back to the newest GE-Proton
+```
+
+Things to know:
+
+- **What counts as a Proton:** any folder with a `proton` script and a `version` file: GE-Proton, Steam's Protons, Proton-CachyOS, UMU-Proton, or one you built yourself. They are looked for in Steam's `compatibilitytools.d` and `steamapps/common` (native and Flatpak), in `/usr/share/steam/compatibilitytools.d` and in this tool's own folder. Names don't depend on upper or lower case.
+- **Its own prefix:** a profile with its own Proton gets a wine prefix of its own (`~/.local/share/victory-proton/prefixes/<name>`), set up on its first run, so different wine versions never share one. Saves and caches stay per profile as always.
+- **The fast wineserver is for GE-Proton only.** With any other Proton the game runs with that Proton's own wineserver, and busy scenes are about half as fast. `status` tells you which one is in use.
+- **For one run, or for every profile:** `VP_PROTON=experimental victory-proton` overrides it for that run. `VP_PROTON` in `~/.config/victory-proton/config` applies to all profiles.
+- For a fork you add, `VP_PROTON=...` among its variables does the same: `victory-proton profile add someone/fork NAME BRANCH VP_PROTON=GE-Proton10-34`.
 
 ## Requirements
 
@@ -134,6 +159,8 @@ To mark a fork you add as native: `victory-proton profile add someone/fork NAME 
 | `victory-proton thp` | set up huge pages for the profiles that use them (`kroeeee`): builds the helper and gives it `CAP_SYS_NICE` with `sudo`, once |
 | `victory-proton vkd3d` | build or update native vkd3d-proton (native profiles only) |
 | `victory-proton proton [TAG]` | install the newest GE-Proton, or the release `TAG` |
+| `victory-proton proton list` | every Proton found on this PC |
+| `victory-proton profile proton NAME [PROTON\|default]` | run a profile with another Proton (see [Using another Proton](#using-another-proton)) |
 | `victory-proton update` / `build` | only update, or only build |
 | `victory-proton status` | what is set up and what is missing |
 | `victory-proton log [N]` | the path of the last run's log and its last `N` lines (40 by default) |
@@ -155,7 +182,7 @@ Every setting is a `VP_*` variable. Set it in the environment for one run (`VP_W
 | `VP_CONFIG_DIR` | `~/.config/victory-proton` | where the settings go |
 | `VP_SRC` | `VP_DATA/profiles/<profile>/src` | use an existing VIctory checkout instead |
 | `VP_UPSTREAM` / `VP_BRANCH` | the profile's | override the repository or branch |
-| `VP_PROTON` | the newest GE-Proton found | a Proton folder to use |
+| `VP_PROTON` | the profile's Proton, else the newest GE-Proton | a Proton for every profile: a folder, a name from `proton list`, a version, or `experimental` |
 | `VP_WINESERVER` | the patched one (built on the first run) | path of a wineserver to use; `0` uses Proton's own and does not build one |
 | `VP_GPU` | detected | `amd`, `nvidia` or `intel`: decides the GPU-specific switches |
 | `VP_SANDBOX` | `1` | `0` runs without bubblewrap; the game folder is then **not** protected |
@@ -214,8 +241,10 @@ VIctory is built for `x86_64-pc-windows-msvc` with [cargo-xwin](https://github.c
   profiles        profiles you added
   profile         the default profile
   game            the game folder
+  protons         the Proton chosen for each profile
 ~/.local/share/victory-proton/      (VP_DATA)
-  prefix/         the shared wine prefix
+  prefix/         the shared wine prefix (profiles on the default Proton)
+  prefixes/<name>/  a prefix for each Proton chosen for a profile
   proton/         GE-Proton, if Steam is not installed
   wineserver/     the patched wineserver (and its ~1 GB build tree, safe to delete)
   proton-vt/      GE-Proton copies (hard links) with the patched wineserver

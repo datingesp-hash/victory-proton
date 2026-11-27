@@ -15,6 +15,7 @@ CONFIG_DIR=${VP_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/victory-proton}
 [[ -f $CONFIG_DIR/config ]] && source "$CONFIG_DIR/config"
 DATA=${VP_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/victory-proton}
 PROFILES_FILE=$CONFIG_DIR/profiles   # profiles you added
+PROTONS_FILE=$CONFIG_DIR/protons     # the Proton chosen for a profile: NAME PROTON
 DEFAULT_FILE=$CONFIG_DIR/profile     # the default profile's name
 GAME_FILE=$CONFIG_DIR/game           # the game folder
 REPO_DIR=$(dirname "$(realpath "${BASH_SOURCE[0]}")")
@@ -188,9 +189,46 @@ profile_list() {
     echo "${c_dim}* = the one used now. victory-proton profile NAME sets the default; -p NAME uses one for a run.$c_off"
 }
 
+# victory-proton profile proton NAME [PROTON|default]
+profile_proton_cmd() {
+    local name=${1:-} which=${*:2}
+    [[ -n $name ]] || die "usage: victory-proton profile proton NAME [PROTON|default]  (PROTON: a folder, a name from 'victory-proton proton list', or experimental)"
+    [[ -n ${P_URL[$name]+x} ]] || die "no profile '$name' (have: $(printf '%s\n' "${!P_URL[@]}" | sort | xargs))"
+    if [[ -z $which ]]; then
+        local saved=$PROFILE w; PROFILE=$name
+        w=$(profile_proton); PROFILE=$saved
+        echo "${w:-default (the newest GE-Proton)}"; return
+    fi
+    mkdir -p "$CONFIG_DIR"; touch "$PROTONS_FILE"
+    local tmp; tmp=$(mktemp)
+    awk -v n="$name" '$1 != n' "$PROTONS_FILE" >"$tmp"
+    if [[ $which == default ]]; then
+        mv "$tmp" "$PROTONS_FILE"
+        info "profile $name: back to the default Proton (the newest GE-Proton)"; return
+    fi
+    local dir; dir=$(resolve_proton "$which")
+    if [[ -z $dir && ! ( $which == GE-Proton* && $which != */* ) ]]; then
+        rm -f "$tmp"; die "no Proton '$which' found (see: victory-proton proton list)"
+    fi
+    printf '%s %s\n' "$name" "$which" >>"$tmp"
+    mv "$tmp" "$PROTONS_FILE"
+    info "profile $name now runs with ${dir:-$which (installed on its next run)}, in a wine prefix of its own"
+    if [[ -n $dir && $(proton_tag "$dir") != GE-Proton* ]]; then
+        warn "not a GE-Proton: it runs with its own wineserver (the patched one is built for GE-Proton only)"
+    fi
+    return 0
+}
+
+proton_list() {
+    local tag d
+    while read -r tag d; do printf '%-40s %s\n' "$tag" "$d"; done < <(list_all | sort -V)
+    echo "${c_dim}Set one for a profile with: victory-proton profile proton NAME PROTON (a folder name or version from above, or experimental)$c_off"
+}
+
 profile_cmd() {
     case ${1:-} in
         "")        profile_list ;;
+        proton)    shift; profile_proton_cmd "$@" ;;
         add)       shift; profile_add "$@" ;;
         remove|rm) shift; profile_remove "$@" ;;
         *)
@@ -366,7 +404,37 @@ require_game() {
 }
 
 # ---------------------------------------------------------------- proton
-PROTON_DIR=${VP_PROTON:-}
+# Which Proton runs the game, first that applies:
+#   VP_PROTON (environment or config file): for every profile;
+#   the one set for the profile (`victory-proton profile proton NAME PROTON`,
+#   or VP_PROTON=... among the variables of a profile you added);
+#   the newest GE-Proton installed.
+# PROTON is a folder, a folder name as Steam lists it ("Proton - Experimental",
+# "proton-cachyos-..."), a version ("GE-Proton10-34"), or "experimental".
+# A profile with a Proton of its own gets a wine prefix of its own too.
+profile_proton() {
+    local name which
+    if [[ -f $PROTONS_FILE ]]; then
+        while read -r name which; do
+            [[ $name == "$PROFILE" && -n $which ]] && { printf '%s' "$which"; return 0; }
+        done <"$PROTONS_FILE"
+    fi
+    local kv
+    for kv in ${P_ENV[$PROFILE]:-}; do
+        [[ $kv == VP_PROTON=?* ]] && { printf '%s' "${kv#VP_PROTON=}"; return 0; }
+    done
+    return 0
+}
+PROTON_WHICH=${VP_PROTON:-$(profile_proton)}
+PROTON_DIR=
+# The prefix: shared by every profile on the default Proton; one per Proton
+# chosen for a profile (prefixes do not like going back and forth between
+# wine versions).
+if [[ -n $PROTON_WHICH && -z ${VP_PROTON:-} ]]; then
+    PREFIX_ROOT=$DATA/prefixes/$(printf '%s' "${PROTON_WHICH##*/}" | tr -c 'A-Za-z0-9._-' '_')
+else
+    PREFIX_ROOT=$DATA/prefix
+fi
 proton_dirs() {
     printf '%s\n' "$HOME/.local/share/Steam/compatibilitytools.d" "$HOME/.steam/root/compatibilitytools.d" \
         "$HOME/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d" \
@@ -379,25 +447,66 @@ install_dir() {
 }
 proton_tag() { awk '{print $2}' "${1:-$PROTON_DIR}/version" 2>/dev/null; }
 
-# Every GE-Proton found, "TAG DIR", oldest first.
-list_ge() {
-    local base d tag
+# Steam's own Protons (Proton - Experimental, Proton 9.0, ...).
+steam_common_dirs() {
+    printf '%s\n' "$HOME/.local/share/Steam/steamapps/common" "$HOME/.steam/root/steamapps/common" \
+        "$HOME/.var/app/com.valvesoftware.Steam/data/Steam/steamapps/common"
+}
+# Every Proton found, "TAG DIR", once each (by real path).
+list_all() {
+    local base d tag seen=" "
     while read -r base; do
         [[ -d $base ]] || continue
         for d in "$base"/*/; do
             d=${d%/}
             [[ -x $d/proton && -f $d/version ]] || continue
+            local real; real=$(realpath "$d")
+            [[ $seen == *" $real "* ]] && continue
+            seen+="$real "
             tag=$(proton_tag "$d")
-            [[ $tag == GE-Proton* ]] && printf '%s %s\n' "$tag" "$d"
+            printf '%s %s\n' "${tag:-?}" "$d"
         done
-    done < <(proton_dirs)
+    done < <(proton_dirs; steam_common_dirs)
+}
+# Every GE-Proton found, "TAG DIR".
+list_ge() { list_all | awk '$1 ~ /^GE-Proton/'; }
+
+# The folder of PROTON (see above), or nothing.
+resolve_proton() {
+    local want=$1 tag d name lc
+    if [[ $want == */* || $want == "~"* ]]; then
+        want=${want/#\~/$HOME}
+        [[ -x $want/proton ]] && printf '%s' "$(realpath "$want")"
+        return 0
+    fi
+    [[ ${want,,} == experimental ]] && want="Proton - Experimental"
+    lc=${want,,}
+    while read -r tag d; do
+        name=$(basename "$d")
+        name=${name,,}
+        if [[ $name == "$lc" || $name == "$lc-x86_64" || ${tag,,} == "$lc" ]]; then
+            printf '%s' "$d"; return 0
+        fi
+    done < <(list_all)
+    return 0
 }
 
 ver_ge() { [[ $(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1) == "$2" ]]; }   # $1 >= $2
 
 find_proton() {
-    if [[ -n $PROTON_DIR ]]; then
-        [[ -x $PROTON_DIR/proton ]] || die "VP_PROTON=$PROTON_DIR has no 'proton' in it"
+    [[ -n $PROTON_DIR ]] && return
+    if [[ -n $PROTON_WHICH ]]; then
+        local from="the Proton set for profile $PROFILE"
+        [[ -n ${VP_PROTON:-} ]] && from="VP_PROTON"
+        PROTON_DIR=$(resolve_proton "$PROTON_WHICH")
+        if [[ -z $PROTON_DIR && $PROTON_WHICH == GE-Proton* && $PROTON_WHICH != */* ]]; then
+            info "$from is $PROTON_WHICH, which is not installed; installing it"
+            install_proton "$PROTON_WHICH" >&2
+            PROTON_DIR=$(resolve_proton "$PROTON_WHICH")
+        fi
+        [[ -n $PROTON_DIR ]] || die "$from is '$PROTON_WHICH', and no such Proton is installed (see: victory-proton proton list)"
+        [[ $(proton_tag) != GE-Proton* ]] || ver_ge "$(proton_tag)" "$GE_MIN" \
+            || warn "$(proton_tag) is older than $GE_MIN, which the first 3D scenes need (exit code 3)"
         return
     fi
     local best
@@ -413,7 +522,7 @@ latest_ge() {
 }
 
 check_proton() {
-    [[ -n ${VP_PROTON:-} ]] && return
+    [[ -n $PROTON_WHICH ]] && return
     local latest; latest=$(latest_ge)
     [[ -n $latest ]] || return 0
     [[ $'\n'$(list_ge) == *$'\n'"$latest "* ]] || warn "a newer GE-Proton is out ($latest; you use $(proton_tag)): victory-proton proton"
@@ -493,6 +602,10 @@ use_wineserver() {
 ensure_wineserver() {
     [[ ${VP_WINESERVER:-} == 0 || -n ${VP_WINESERVER:-} ]] && return 0
     [[ -x $(wineserver_path) ]] && return 0
+    if [[ $(proton_tag) != GE-Proton* ]]; then
+        warn "the patched wineserver is built for GE-Proton only; $(proton_tag) runs with its own (busy scenes about half as fast)"
+        return 0
+    fi
     info "building the patched wineserver for $(proton_tag), once per GE-Proton release (10-20 min; VP_WINESERVER=0 skips it)"
     if ! VP_PROTON=$PROTON_DIR "$REPO_DIR/victory-proton" wineserver; then
         warn "could not build the patched wineserver; running with Proton's own (busy scenes will be about half as fast)"
@@ -718,14 +831,14 @@ steam_client() {
 prefix() {
     ((NATIVE)) && return
     find_proton
-    local stamp=$DATA/prefix/.victory-proton
-    if [[ -d $DATA/prefix/pfx && -f $stamp && $(<"$stamp") == "$(proton_tag)" ]]; then return; fi
+    local stamp=$PREFIX_ROOT/.victory-proton
+    if [[ -d $PREFIX_ROOT/pfx && -f $stamp && $(<"$stamp") == "$(proton_tag)" ]]; then return; fi
     info "setting up the wine prefix with $(proton_tag) (installs DXVK and vkd3d-proton)"
-    mkdir -p "$DATA/prefix"
-    STEAM_COMPAT_DATA_PATH=$DATA/prefix STEAM_COMPAT_CLIENT_INSTALL_PATH=$(steam_client) WINEDEBUG=-all \
+    mkdir -p "$PREFIX_ROOT"
+    STEAM_COMPAT_DATA_PATH=$PREFIX_ROOT STEAM_COMPAT_CLIENT_INSTALL_PATH=$(steam_client) WINEDEBUG=-all \
         "$PROTON_DIR/proton" run "$EXE" config >/dev/null 2>&1 || true
-    [[ -f $DATA/prefix/pfx/drive_c/windows/system32/d3d12core.dll ]] \
-        || die "Proton did not set up the prefix in $DATA/prefix"
+    [[ -f $PREFIX_ROOT/pfx/drive_c/windows/system32/d3d12core.dll ]] \
+        || die "Proton did not set up the prefix in $PREFIX_ROOT"
     proton_tag >"$stamp"
 }
 
@@ -736,7 +849,7 @@ prefix() {
 # shows. Microsoft's DLL (winetricks d3dcompiler_47) compiles them. Checked
 # on every launch because Proton may put its builtin back when it updates.
 d3dcompiler_native() {
-    local dll=$DATA/prefix/pfx/drive_c/windows/system32/d3dcompiler_47.dll
+    local dll=$PREFIX_ROOT/pfx/drive_c/windows/system32/d3dcompiler_47.dll
     [[ -f $dll ]] && ! grep -aq 'Wine builtin DLL' "$dll"
 }
 d3dcompiler() {
@@ -744,7 +857,7 @@ d3dcompiler() {
     d3dcompiler_native && return
     need winetricks
     info "installing Microsoft's d3dcompiler_47 in the prefix (wine's cannot compile VIctory's shaders)"
-    WINEPREFIX=$DATA/prefix/pfx WINE=$PROTON_DIR/files/bin/wine WINESERVER=$PROTON_DIR/files/bin/wineserver \
+    WINEPREFIX=$PREFIX_ROOT/pfx WINE=$PROTON_DIR/files/bin/wine WINESERVER=$PROTON_DIR/files/bin/wineserver \
         WINEDEBUG=-all winetricks -q --force d3dcompiler_47 >/dev/null 2>&1 || true
     d3dcompiler_native || warn "could not install d3dcompiler_47; the 3D world will be black"
     return 0
@@ -841,7 +954,7 @@ launch() {
     # for what neither set.
     local penv; penv=$(profile_vars)
     export_profile_vars
-    export WINEPREFIX=$DATA/prefix/pfx
+    export WINEPREFIX=$PREFIX_ROOT/pfx
     export WINEDLLOVERRIDES=${WINEDLLOVERRIDES:-"d3d12,d3d12core,dxgi,d3d11,d3d10core,d3d9,d3dcompiler_47=n,b"}
     export WINEDEBUG=${WINEDEBUG:--all}
     export WINEFSYNC=${WINEFSYNC:-1}
@@ -978,8 +1091,9 @@ status() {
     else
         PROTON_DIR=$( (find_proton 2>/dev/null; printf '%s' "$PROTON_DIR") || true)
         if [[ -n $PROTON_DIR ]]; then
-            printf 'proton      %s  %s\n' "$(proton_tag)" "$PROTON_DIR"
-            printf 'wineserver  %s\n' "$([[ -n $(wanted_wineserver) ]] && echo "$ok patched ($(wanted_wineserver))" || echo "$no stock (built on the next run, or: victory-proton wineserver)")"
+            printf 'proton      %s  %s%s\n' "$(proton_tag)" "$PROTON_DIR" "$([[ -n $PROTON_WHICH ]] && echo "  (set: $PROTON_WHICH)")"
+            printf 'prefix      %s\n' "$PREFIX_ROOT"
+            printf 'wineserver  %s\n' "$([[ -n $(wanted_wineserver) ]] && echo "$ok patched ($(wanted_wineserver))" || echo "$no stock ($([[ $(proton_tag) == GE-Proton* ]] && echo 'built on the next run, or: victory-proton wineserver' || echo 'the patched one is for GE-Proton only'))")"
             if [[ -n $(thp_src) ]]; then
                 printf 'huge pages  %s\n' "$(thp_has_cap && echo "$ok ($THP_HELPER)" || echo "$no off (victory-proton thp)")"
             fi
@@ -1045,11 +1159,14 @@ victory-proton: run Xbox Series titles with VIctory on Linux, through GE-Proton
   victory-proton profile add URL [NAME] [BRANCH] [VAR=VALUE ...]
                                                     add a fork (github.com/o/r/tree/branch works)
   victory-proton profile remove NAME
+  victory-proton profile proton NAME [PROTON|default]
+                          run a profile with another Proton (see: victory-proton proton list)
   victory-proton -p NAME|URL ...                    use another profile for one command
   victory-proton wineserver  build the faster wineserver for your GE-Proton (run does it once by itself)
   victory-proton thp      set up huge pages for profiles that use them (kroeeee; asks for sudo once)
   victory-proton vkd3d    build native vkd3d-proton, for native profiles (done on first run)
   victory-proton proton [TAG]  install the newest GE-Proton (or TAG)
+  victory-proton proton list   every Proton found (GE, Steam's, CachyOS, ...)
   victory-proton update | build   only update, or only build
   victory-proton status   what is set up and what is missing
   victory-proton log      the last run's log
@@ -1071,7 +1188,7 @@ case $cmd in
     wineserver) build_wineserver ;;
     thp)        thp_setup ;;
     vkd3d)      build_vkd3d ;;
-    proton)     install_proton "$@" ;;
+    proton)     if [[ ${1:-} == list ]]; then proton_list; else install_proton "$@"; fi ;;
     update)     update ;;
     build)      build "$@" ;;
     status)     status ;;
